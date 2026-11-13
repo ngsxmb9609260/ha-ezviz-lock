@@ -14,7 +14,7 @@ r"""萤石门锁「云存储录像回放」(recType=1 / type=3) -> HAOS /media �
   ffmpeg -c copy              -> .mkv 原件（HEVC 29.92fps 交织 + AAC 16kHz mono）
   按帧 NAL 奇偶拆 A/B        -> 自动挑干净那一路（B 路实测 100% 绿，丢弃）
   ffmpeg 解码 + libx264       -> 15fps H.264
-  原件里的 AAC 音轨           -> 与干净视频重新 mux（SD 回放链路没有音轨）
+  原件里的 AAC 音轨           -> 与干净视频重新 mux
   逐帧验绿                   -> 合格才登记 clean_clips.json
 
 为什么这条链路更值钱（2026-11-13 15:25–15:40 实测）
@@ -22,7 +22,8 @@ r"""萤石门锁「云存储录像回放」(recType=1 / type=3) -> HAOS /media �
 - 27 段云录像 vs HA 40 条开门记录，±15 秒内匹配 16 对，多数只差 0–2 秒：
   云段本身就是开门事件触发的短片，时间点精确，不需要 ±90 秒就近配。
 - 首帧人工确认是真实掌静脉开门画面（人抬手、抱快递），无绿无黑。
-- 云回放流带 AAC 16 kHz mono 音轨；SD 回放流从头到尾没有音轨。
+- 云回放流带 AAC 16 kHz mono 音轨。（v1.4.0 起确认 SD 回放流同样带音轨，
+  早期 SD 脚本是 `-an` 主动丢掉的，不是设备没录；见 ezviz_sd_pull.py。）
 - 全程不打扰设备（读云端已存好的文件），不占 SD 回放的会话配额。
 
 产物
@@ -648,6 +649,33 @@ def mark_clean(root: Path, out: Path, frames: int, green: float,
     log(f"  已登记干净白名单：{rel}（{frames} 帧 / 绿 {green * 100:.2f}% / 音轨 {has_audio}）")
 
 
+def find_other_clip(root: Path, start: datetime, suffix: str,
+                    window_s: int = 15) -> Path | None:
+    """同一事件是否已被「另一条链路」补过（按起始时刻 ±window_s 判定）。
+
+    v1.4.0 起主链路是 SD（画质最高、不吃云配额），云只做兜底。
+    两条链路若都跑，同一开门瞬间会各出一份片；用 15 秒窗口合并，
+    实测 SD 段与云段起始只差 1–3 秒（例：SD 20:55:39 / 云 20:55:38）。
+    """
+    date_dir = root / start.strftime("%Y-%m-%d")
+    if not date_dir.is_dir():
+        return None
+    mine = date_dir / (start.strftime("%H%M%S") + suffix)
+    if mine.exists() and mine.stat().st_size > MIN_RAW_BYTES:
+        return mine
+    target = int(start.timestamp())
+    for p in date_dir.glob("??????" + suffix):
+        try:
+            t = datetime.strptime(p.name[:6], "%H%M%S")
+        except ValueError:
+            continue
+        ts = int(t.replace(year=start.year, month=start.month,
+                           day=start.day).timestamp())
+        if abs(ts - target) <= window_s and p.stat().st_size > MIN_RAW_BYTES:
+            return p
+    return None
+
+
 def event_priority(pending: list[dict], state_glob: str, window_s: int) -> list[dict]:
     """与开门/徘徊时刻接近的云段排最前（云段本身即事件触发，通常 0–2 秒）。"""
     import glob
@@ -745,7 +773,11 @@ def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
 
     def already_done(seg: dict) -> bool:
         p = out_path(seg)
-        return p.exists() and p.stat().st_size > MIN_RAW_BYTES
+        if p.exists() and p.stat().st_size > MIN_RAW_BYTES:
+            return True
+        # SD 链路已经补过同一事件就不再来云上重复取一份（v1.4.0：SD 优先）
+        st = datetime.fromtimestamp(seg["startTime"] / 1000)
+        return find_other_clip(root, st, "_sd.mp4") is not None
 
     pending = [s for s in segs if not already_done(s)]
     log(f"其中待补 {len(pending)} 段（已有 {len(segs) - len(pending)} 段）")

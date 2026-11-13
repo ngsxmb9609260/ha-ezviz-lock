@@ -1,6 +1,22 @@
+# 门锁录像补录 —— 两条自动化（v1.4.0 默认形态：SD 优先、云端兜底）
+#
+# 触发 -> run_ezviz_pull.sh -> 先 SD 直取（带声音 / 上下双路）
+#                          -> rc=1/2/5/6 时自动改走云端（同样双路 + 声音）
+# 两条链路按 ±15 秒去重，同一开门瞬间只会留一份片。
+#
+# configuration.yaml 需要：
+# shell_command:
+#   ezviz_sd_pull: "/bin/sh /config/scripts/run_ezviz_pull.sh --bg --limit 1 --event-priority"
+#   ezviz_sd_pull_check: "/bin/sh /config/scripts/run_ezviz_pull.sh --check"
+#   ezviz_cloud_pull: "/bin/sh /config/scripts/run_ezviz_cloud_pull.sh --bg --limit 1 --event-priority"
+#
+# 两条自动化都需要：把 event.y3000fvx_plus_yourserial_door_open_event 和
+# sensor.your_ezviz_lock_loiter_alerts_today 换成你实际的实体 ID。
+
+# ① 主链路：SD 直取（180 秒等设备封口），失败由包装器内部改走云端
 - id: '1794500000001'
-  alias: 门锁 SD 录像补录（开门即补 + 30 分钟兜底）
-  description: 门锁一有开门事件就补一段（先等 3 分钟让设备把这段封口）；另每 30 分钟兜底一次。v1.3.1 起包装器默认把本自动化的触发改道云存储双路补录（SD 单路产出停用），徘徊事件因此也能拿到双路片；把包装器 SD_PULL_ENABLED 改回 1 可恢复单路 SD 链路
+  alias: 门锁录像补录（SD 优先 + 云端兜底）
+  description: 开门/徘徊后等 180 秒让设备封口，再从锁的 SD 卡直接取（带 AAC 声音、上下双路）；SD 取不到时包装器内部自动改走云端。另每 30 分钟兜底一次
   triggers:
   - trigger: time_pattern
     minutes: /30
@@ -19,9 +35,13 @@
     id: loiter_event
   conditions:
   - condition: template
-    value_template: "{% set tid = trigger.id | default('scan') %} {{ tid == 'scan'\n   or (tid == 'door_event' and trigger.to_state is defined\n       and trigger.to_state.attributes.get('event_type') !=\
-      \ 'open_close')\n   or (tid == 'loiter_event' and trigger.from_state is defined and trigger.to_state is defined\n       and (trigger.to_state.state | int(0)) > (trigger.from_state.state | int(0)))\
-      \ }}"
+    value_template: >-
+      {% set tid = trigger.id | default('scan') %}
+      {{ tid == 'scan'
+         or (tid == 'door_event' and trigger.to_state is defined
+             and trigger.to_state.attributes.get('event_type') != 'open_close')
+         or (tid == 'loiter_event' and trigger.from_state is defined and trigger.to_state is defined
+             and (trigger.to_state.state | int(0)) > (trigger.from_state.state | int(0))) }}
   actions:
   - if:
     - condition: template
@@ -30,6 +50,36 @@
     - delay:
         seconds: 180
   - action: shell_command.ezviz_sd_pull
+    data: {}
+  mode: queued
+  max: 2
+
+# ② 慢兜底：10 分钟后再独立跑一次云端
+#    延迟必须明显大于 ① 的 180 秒，否则会和 SD 链路抢同一事件。
+- id: '1794500000002'
+  alias: 门锁云录像补录（慢兜底）
+  description: recType=1 / type=3 云存储回放。主链路已是 SD（包装器内部含云端兜底），本自动化只做 10 分钟后的慢兜底
+  triggers:
+  - trigger: time_pattern
+    minutes: /30
+    id: scan
+  - trigger: state
+    entity_id: event.y3000fvx_plus_yourserial_door_open_event
+    not_to:
+    - unknown
+    - unavailable
+    id: door_event
+  conditions:
+  - condition: template
+    value_template: >-
+      {% set tid = trigger.id | default('scan') %}
+      {{ tid == 'scan'
+         or (tid == 'door_event' and trigger.to_state is defined
+             and trigger.to_state.attributes.get('event_type') != 'open_close') }}
+  actions:
+  - delay:
+      seconds: 600
+  - action: shell_command.ezviz_cloud_pull
     data: {}
   mode: queued
   max: 2

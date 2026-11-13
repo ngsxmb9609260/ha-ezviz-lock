@@ -29,10 +29,24 @@ open.ys7.com
   /api/lapp/v2/live/address/get (type=2) -> 让门锁把该段 SD 录像推成 FLV 流
         |
         v
-  ffmpeg -c copy                    -> .mkv 原件（HEVC，字节级保真，可留档）
+  ffmpeg -c copy                    -> .mkv 原件（HEVC + AAC，字节级保真，可留档）
   ffmpeg hevc_mp4toannexb           -> Annex-B 裸流
-  按帧 NAL 奇偶拆成 A / B 两路     -> 自动挑干净那一路
+  按帧 NAL 奇偶拆成 A / B 两路     -> A 路干净；B 路换下摄参数集后同样干净
   ffmpeg 正常解码 + libx264         -> .mp4（约 15fps H.264，逐帧无绿）
+  音轨单独抽取后重新 mux            -> AAC 16kHz mono，前端直接出声
+
+双路（v1.4.0 起可选 `--dual-road`）
+----------------------------------
+SD 回放与云回放同源：两路摄像头帧奇偶交织进一条 HEVC，却只带上摄的
+1504x1968 SPS，下摄帧按错画幅解码必然全绿。换入下摄的 VPS/SPS/PPS
+（同目录 `ezviz_cloud_pull.py` 里的 `B_ROAD_PARAMS_HEX`）后 B 路 0% 绿，
+再按「上摄在上 / 下摄在下」vstack 成 720x1348。失败自动回退单路 A。
+
+声音（v1.4.0 修复）
+------------------
+早期版本 `-map 0:v:0` + `-an` 把音轨主动丢了，所以 2026-11-13 之前每一张
+`_sd.mp4` 都没声音。实测 SD 回放流本身带 **AAC 16kHz mono**（flv/rtmp/hls
+三种协议都能拉到），现已保留。若某段音轨异常，脚本退化为无声音但画面照出。
 
 为什么必须拆流（2026-11-12 11:10 实测结论，替代此前错误的关键帧方案）
 ---------------------------------------------------------------------
@@ -45,8 +59,9 @@ open.ys7.com
   - 换 11-12 08:03 段复验：A 路 45 帧 0% 绿 / B 路 45 帧 92.3% 绿
   - A 路转码成品：76 帧 / 5.07s / 15fps，逐帧绿占比 0.00%，相邻帧有真实变化
 
-B 路到底是什么（双摄另一路？加密数据？）**未验证**，本脚本直接丢弃它。
-A 路是主画面（门口、人、时间戳），帧率约为标称 30fps 的一半。
+B 路＝下摄（俯拍地面/脚部视角），2026-11-13 16:49 用 App 导出的下摄 mp4 取出
+参数集后解决：不是加密、不是跨路预测，纯参数集/画幅错配。加 `--dual-road`
+即可输出上下拼合；不加仍是原行为（只出 A 路）。
 
 其它实测结论
 ------------
@@ -116,13 +131,26 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2026-11-12-haos"
+VERSION = "2026-11-14-sd2"
 
 DEFAULT_REGION_HOST = "https://open.ys7.com"
 REQUEST_TIMEOUT = 20
 PLACEHOLDER_RESOLUTIONS = ("512x288", "512x272", "640x360")
 MIN_RAW_BYTES = 20_000
 MAX_LOG_BYTES = 5 * 1024 * 1024
+
+# 退出码：包装器据此决定要不要回退云端补录。
+#   0=有产出或已存在  1=部分失败  2=回放通道不可用  3=进程锁被占
+#   4=环境不可用      5=节流跳过  6=本轮没有可补的段（需要云端兜底）
+EXIT_NO_CLIP = 6
+
+# 下摄（B 路，1920x1080 横屏）的参数集。SD 回放与云回放一样，只带上摄的
+# 1504x1968 SPS，B 路帧必须换这套才能解码（否则全绿）。参数集与云脚本共用，
+# 避免两处各维护一份；单独部署 SD 脚本而云脚本缺席时自动降级为单路 A。
+try:  # noqa: SIM105 - 缺文件属正常部署形态，降级即可
+    from ezviz_cloud_pull import B_ROAD_PARAMS_HEX  # type: ignore
+except Exception:  # pragma: no cover - 单脚本部署
+    B_ROAD_PARAMS_HEX = {}
 
 # ---------------------------------------------------------------------------
 # 平台路径：HAOS 用 /config、/media；Windows 调试机回退 Y:/M:
@@ -479,14 +507,43 @@ def is_placeholder(info: str) -> bool:
     return bool(m and int(m.group(1)) < 640)
 
 
-def pull_raw(ffmpeg: str, url: str, dest: Path, seconds: int) -> None:
-    """原样直拷，不解码不转码：保留设备 SD 卡里的原始码流。"""
+def has_audio_stream(ffmpeg: str, path: Path) -> bool:
+    """看原件里有没有音轨（SD 回放实测带 AAC 16kHz mono，早期脚本把它丢了）。"""
+    res = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path)],
+        capture_output=True, text=True, errors="replace", timeout=30,
+    )
+    return "Audio:" in (res.stderr or "")
+
+
+def extract_audio(ffmpeg: str, raw: Path, dest: Path) -> bool:
+    """把回放流自带的 AAC 抽成 m4a，供清洗后的视频重新 mux。
+
+    只取 16kHz 单声道再压到 32k：源流本身就是这个规格，转码只为
+    保证 mux 时容器/参数完全可控，体积几乎不变。
+    """
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+           "-i", str(raw), "-map", "0:a:0", "-vn",
+           "-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1",
+           "-f", "mp4", str(dest)]
+    res = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=120)
+    return res.returncode == 0 and dest.exists() and dest.stat().st_size > 1000
+
+
+def pull_raw(ffmpeg: str, url: str, dest: Path, seconds: int) -> bool:
+    """原样直拷，不解码不转码：保留设备 SD 卡里的原始码流。
+
+    视频与音轨一起拷（`0:a:0?` 的问号表示没音轨也不报错）。旧版只 `-map 0:v:0`，
+    所以以前每一张 `_sd.mp4` 天生没声音——不是设备没录。
+    返回原件是否带音轨。
+    """
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-rw_timeout", "30000000",
         "-i", url,
         "-t", str(max(3, seconds)),
-        "-map", "0:v:0", "-c", "copy", "-f", "matroska", str(dest),
+        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+        "-f", "matroska", str(dest),
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=seconds + 120)
     err = res.stderr or ""
@@ -497,6 +554,7 @@ def pull_raw(ffmpeg: str, url: str, dest: Path, seconds: int) -> None:
                 "回放 URL 被流服务器拒绝（" + ", ".join(c for c in ("404", "405", "403", "401") if c in err) + "）"
             )
         raise RuntimeError(f"ffmpeg 取流失败：{err[-300:]}")
+    return has_audio_stream(ffmpeg, dest) if has_data else False
 
 
 def iter_annexb_nals(data: bytes):
@@ -581,14 +639,32 @@ def split_interleaved_hevc(ffmpeg: str, raw: Path, workdir: Path) -> tuple[Path,
     return best[1], desc
 
 
-def to_playable(ffmpeg: str, h265: Path, out: Path, fps: int = 15) -> None:
-    """把拆好的干净 HEVC 正常解码 + 重编码成 H.264（不再只留关键帧）。"""
+def to_playable(ffmpeg: str, h265: Path, out: Path, audio: Path | None = None,
+                fps: int = 15) -> bool:
+    """把拆好的干净 HEVC 正常解码 + 重编码成 H.264；有音轨就一起 mux。
+
+    旧版固定 `-an`，视频修好了但声音被丢掉。现在 audio=None 才走静音，
+    所以 SD 单路/双路成品都能带声音。返回成品是否含音轨。
+    """
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-r", str(fps), "-i", str(h265),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", "-f", "mp4",
     ]
+    if audio is not None:
+        cmd += ["-i", str(audio)]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-pix_fmt", "yuv420p"]
+    if audio is not None:
+        # apad 把音轨补到与视频等长，再由 -shortest 收在视频结束点。
+        # 只用 -shortest（不 apad）会把视频尾部帧截掉：实测 144 帧的段被截成
+        # 115 帧，丢 0.9 秒真实画面。apad 单独用则音轨无限长，ffmpeg 不会停。
+        cmd += ["-map", "0:v:0", "-map", "1:a:0",
+                "-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1",
+                "-af", "apad", "-shortest"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-movflags", "+faststart", "-f", "mp4"]
+
     for mode in (["-fps_mode", "passthrough"], ["-vsync", "0"]):
         if out.exists():
             out.unlink()
@@ -598,10 +674,76 @@ def to_playable(ffmpeg: str, h265: Path, out: Path, fps: int = 15) -> None:
         )
         err = res.stderr or ""
         if res.returncode == 0 and out.exists() and out.stat().st_size > MIN_RAW_BYTES:
-            return
+            return audio is not None
         if "Unrecognized option" not in err and "Option not found" not in err:
             raise RuntimeError(f"H.264 重编码失败：{err[-400:]}")
     raise RuntimeError("H.264 重编码失败（新旧参数均不可用）")
+
+
+def fix_b_road(ffmpeg: str, annexb: Path, workdir: Path) -> tuple[Path, int]:
+    """给下摄（B 路）帧换上下摄的 VPS/SPS/PPS，解出 1920x1080 正常画面。
+
+    与云回放同一套根因：SD 回放也只带上摄的 1504x1968 SPS，B 路帧按那套
+    解码必然全绿。本函数不动帧数据，只替换参数集，并在每个 IDR 前补一份，
+    方便任意 seek。已在 2026-11-13 21:5x 的 SD 段（20:55:39）实测通过。
+    """
+    if not B_ROAD_PARAMS_HEX:
+        raise RuntimeError("缺少下摄参数集（同目录 ezviz_cloud_pull.py 不可用）")
+    frames: list[bytes] = []
+    for payload, nal_type in iter_annexb_nals(annexb.read_bytes()):
+        if 1 <= nal_type <= 21:
+            frames.append(payload)
+    b_frames = frames[1::2]
+    if len(b_frames) < 15:
+        raise RuntimeError(f"B 路只有 {len(b_frames)} 帧，不足以成片")
+
+    start_code = b"\x00\x00\x00\x01"
+    head = b"".join(start_code + bytes.fromhex(B_ROAD_PARAMS_HEX[t])
+                    for t in (32, 33, 34))
+    buf = bytearray(head)
+    for f in b_frames:
+        if ((f[0] >> 1) & 0x3F) in (19, 20, 21):
+            buf += head
+        buf += start_code + f
+    out = workdir / "stream_B_fixed.h265"
+    out.write_bytes(bytes(buf))
+    n, ratio = green_frame_ratio(ffmpeg, out)
+    log(f"  B 路修复：{len(b_frames)} 个 NAL -> {n} 帧，绿帧 {ratio * 100:.2f}%")
+    if n < 15 or ratio > 0.02:
+        raise RuntimeError(f"B 路修复后仍不合格（{n} 帧 / 绿 {ratio * 100:.2f}%）")
+    return out, n
+
+
+def to_playable_dual(ffmpeg: str, h265_a: Path, h265_b: Path, out: Path,
+                     audio: Path | None = None, fps: int = 15,
+                     width: int = 720) -> bool:
+    """上摄(A)在上、下摄(B)在下垂直拼合，H.264 + 可选 AAC。文件名不变。"""
+    filt = (f"[0:v]scale={width}:-2,setsar=1[up];"
+            f"[1:v]scale={width}:-2,setsar=1[dn];"
+            "[up][dn]vstack=inputs=2,format=yuv420p[v]")
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+           "-r", str(fps), "-i", str(h265_a),
+           "-r", str(fps), "-i", str(h265_b)]
+    if audio is not None:
+        cmd += ["-i", str(audio)]
+    cmd += ["-filter_complex", filt, "-map", "[v]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-pix_fmt", "yuv420p"]
+    if audio is not None:
+        cmd += ["-map", "2:a:0", "-c:a", "aac", "-b:a", "32k",
+                "-ar", "16000", "-ac", "1", "-af", "apad", "-shortest"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-movflags", "+faststart", "-f", "mp4", str(out)]
+    # 输入已用 -r 固定 15fps，输出不再加 -r / -fps_mode，避免 ffmpeg 9 的
+    # "non-CFR -vsync 与 -r 冲突"。两路帧数相同，天然对齐。
+    if out.exists():
+        out.unlink()
+    res = subprocess.run(cmd, capture_output=True, text=True,
+                         errors="replace", timeout=300)
+    if res.returncode == 0 and out.exists() and out.stat().st_size > MIN_RAW_BYTES:
+        return audio is not None
+    raise RuntimeError(f"双路拼合失败：{(res.stderr or '')[-400:]}")
 
 
 def _md5(path: Path) -> str:
@@ -612,7 +754,8 @@ def _md5(path: Path) -> str:
     return h.hexdigest()
 
 
-def mark_clean(root: Path, out: Path, frames: int, green: float, duration_s: int) -> None:
+def mark_clean(root: Path, out: Path, frames: int, green: float, duration_s: int,
+               has_audio: bool = False) -> None:
     """把逐帧验收合格的成品登记进干净白名单 clean_clips.json。
 
     集成侧只读这份白名单生成前端可播的录像索引，任何绿片都进不来。
@@ -645,7 +788,9 @@ def mark_clean(root: Path, out: Path, frames: int, green: float, duration_s: int
         "green_ratio": round(green, 4),
         "duration_s": round(frames / 15.0, 2) if not duration_s else duration_s,
         "start_ms": start_ms,
-        "codec": "h264",
+        "codec": "h264+aac" if has_audio else "h264",
+        "source": "sd",
+        "has_audio": bool(has_audio),
         "usable_for_open": bool(re.fullmatch(r"\d{6}_sd\.mp4", out.name)),
         "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "verified_by": f"ezviz_sd_pull.py 逐帧自检（{VERSION}）",
@@ -660,7 +805,7 @@ def mark_clean(root: Path, out: Path, frames: int, green: float, duration_s: int
         "note": "逐帧解码统计纯绿像素占比；绿片一律不进匹配池",
     }
     atomic_write(idx_path, json.dumps(idx, ensure_ascii=False, indent=1))
-    log(f"  已登记干净白名单：{rel}（{frames} 帧 / 绿 {green * 100:.2f}%）")
+    log(f"  已登记干净白名单：{rel}（{frames} 帧 / 绿 {green * 100:.2f}% / 音轨 {has_audio}）")
 
 
 def event_priority(pending: list[dict], state_glob: str, window_s: int,
@@ -743,6 +888,12 @@ def main() -> int:
                     help="忽略最小间隔节流（手动补录时用）")
     ap.add_argument("--no-lock", action="store_true", help="不检查进程互斥锁")
     ap.add_argument("--no-index", action="store_true", help="不写干净白名单 clean_clips.json")
+    ap.add_argument("--dual-road", action="store_true",
+                    help="输出上摄在上/下摄在下的双路拼合成品（默认关闭＝只出 A 路）")
+    ap.add_argument("--dual-width", type=int, default=720,
+                    help="双路上下拼合后的总宽度，默认 720")
+    ap.add_argument("--no-audio", action="store_true",
+                    help="不保留音轨（默认保留；仅在音轨导致 mux 异常时应急用）")
     args = ap.parse_args()
 
     set_log_file(args.log_file or os.environ.get("EZVIZ_LOG_FILE") or None)
@@ -785,6 +936,32 @@ def main() -> int:
         lock.release()
 
 
+def find_other_clip(root: Path, start: datetime, suffix: str,
+                    window_s: int = 15) -> Path | None:
+    """同一事件是否已被「另一条链路」补过（按起始时刻 ±window_s 判定）。
+
+    SD 段与云段的起始时刻实测只差 1–3 秒（例：SD 20:55:39 / 云 20:55:38），
+    所以用 15 秒窗口足够合并同一事件，又不会误伤相隔较远的两次开门。
+    """
+    date_dir = root / start.strftime("%Y-%m-%d")
+    if not date_dir.is_dir():
+        return None
+    mine = date_dir / (start.strftime("%H%M%S") + suffix)
+    if mine.exists() and mine.stat().st_size > MIN_RAW_BYTES:
+        return mine
+    target = int(start.timestamp())
+    for p in date_dir.glob("??????" + suffix):
+        try:
+            t = datetime.strptime(p.name[:6], "%H%M%S")
+        except ValueError:
+            continue
+        ts = int(t.replace(year=start.year, month=start.month,
+                           day=start.day).timestamp())
+        if abs(ts - target) <= window_s and p.stat().st_size > MIN_RAW_BYTES:
+            return p
+    return None
+
+
 def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
     api = Ezviz(cred)
     now_ms = int(time.time() * 1000)
@@ -794,7 +971,11 @@ def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
     def already_done(seg: dict) -> bool:
         st = datetime.fromtimestamp(seg["startTime"] / 1000)
         target = root / st.strftime("%Y-%m-%d") / (st.strftime("%H%M%S") + "_sd.mp4")
-        return target.exists() and target.stat().st_size > MIN_RAW_BYTES
+        if target.exists() and target.stat().st_size > MIN_RAW_BYTES:
+            return True
+        # 云链路已经补过同一事件就不再占设备回放通道（两条链路互为兜底，
+        # 但同一时刻只出一份片）
+        return find_other_clip(root, st, "_cloud.mp4") is not None
 
     # 只选「还没落盘」的段：定时任务每次拉一段，就能逐段把历史补齐，
     # 而不是永远盯着最新那一段、发现已存在就直接跳过。
@@ -829,8 +1010,8 @@ def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
     else:
         segs = pending[-args.limit :] if args.limit else pending
     if not segs:
-        log("没有待补录像，结束")
-        return 0
+        log(f"没有待补录像，结束（退出码 {EXIT_NO_CLIP}：交给云端兜底）")
+        return EXIT_NO_CLIP
 
     # 最小间隔节流：开门事件会把补录触发得很密集（一次连开三次门就是三个触发），
     # 而回放通道连续取流 12-14 段后必然进入 15-20 分钟冷却（表现为 404 / 512x288 提示图）。
@@ -899,29 +1080,54 @@ def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
                             f"{date_dir} 不可写：HAOS 上请以 root 运行（HA 主容器内）或加 sudo"
                         ) from None
                     raw_mkv.unlink(missing_ok=True)
-                    pull_raw(ffmpeg, url, raw_mkv, duration)
+                    audio_present = pull_raw(ffmpeg, url, raw_mkv, duration)
                     if not raw_mkv.exists() or raw_mkv.stat().st_size < MIN_RAW_BYTES:
                         size = raw_mkv.stat().st_size if raw_mkv.exists() else 0
                         raise ChannelUnavailable(f"回放流无数据/仅提示图（{size} B）")
                     info = probe_stream(ffmpeg, raw_mkv)
                     if is_placeholder(info):
                         raise ChannelUnavailable(f"只拿到 512x288 提示流（{info[:70]}）")
-                    log(f"  原件 {raw_mkv.stat().st_size} B | {info[:100]}")
+                    log(f"  原件 {raw_mkv.stat().st_size} B | {info[:100]} | 音轨 {audio_present}")
                     h265, desc = split_interleaved_hevc(ffmpeg, raw_mkv, Path(td))
-                    to_playable(ffmpeg, h265, out_mp4)
+                    # 音轨单独抽出来重新 mux：拆流只动视频轨，音轨原地保留会与
+                    # 重编码后的时长对不齐（-shortest 会截掉尾巴）。
+                    audio_m4a = None
+                    if audio_present and not args.no_audio:
+                        audio_m4a = Path(td) / f"{stem}.m4a"
+                        if not extract_audio(ffmpeg, raw_mkv, audio_m4a):
+                            log("  音轨抽取失败，本段退化为无声音（不影响画面）")
+                            audio_m4a = None
+                    dual_done = False
+                    if args.dual_road:
+                        try:
+                            a_h265 = Path(td) / "stream_A.h265"
+                            n_a, g_a = green_frame_ratio(ffmpeg, a_h265)
+                            if n_a < 15 or g_a > 0.02:
+                                raise RuntimeError(
+                                    f"A 路不干净（{n_a} 帧 / 绿 {g_a * 100:.2f}%）")
+                            b_fixed, n_b = fix_b_road(ffmpeg, Path(td) / "raw.h265", Path(td))
+                            has_audio = to_playable_dual(
+                                ffmpeg, a_h265, b_fixed, out_mp4, audio_m4a,
+                                width=args.dual_width)
+                            desc = f"双路上下拼合 上摄 {n_a} 帧 + 下摄 {n_b} 帧"
+                            dual_done = True
+                        except Exception as err:  # noqa: BLE001 - 双路失败就退单路，别丢片
+                            log(f"  双路拼合失败，回退单路 A：{err}")
+                    if not dual_done:
+                        has_audio = to_playable(ffmpeg, h265, out_mp4, audio_m4a)
                     # 成品逐帧兜底：拆流选错路 / 编码异常时，绿片绝不落到交付目录
                     n, green = green_frame_ratio(ffmpeg, out_mp4)
-                    if n == 0 or green > 0.2:
+                    if n == 0 or green > 0.02:
                         out_mp4.unlink(missing_ok=True)
                         raise RuntimeError(
-                            f"成品逐帧自检不合格（{n} 帧 / 绿帧 {green * 100:.1f}%）"
+                            f"成品逐帧自检不合格（{n} 帧 / 绿帧 {green * 100:.2f}%）"
                         )
                     log(
-                        f"  完成 {out_mp4.stat().st_size} B（{desc}，15fps H.264，"
-                        f"逐帧绿 {green * 100:.1f}%）"
+                        f"  完成 {out_mp4.stat().st_size} B（{desc}，15fps H.264"
+                        f"{' + AAC' if has_audio else ''}，逐帧绿 {green * 100:.2f}%）"
                     )
                     if not args.no_index:
-                        mark_clean(root, out_mp4, n, green, 0)
+                        mark_clean(root, out_mp4, n, green, 0, has_audio)
                     if args.keep_raw:
                         shutil.copyfile(raw_mkv, keep_mkv)
                     good = True
