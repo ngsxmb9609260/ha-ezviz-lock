@@ -31,11 +31,17 @@ r"""萤石门锁「云存储录像回放」(recType=1 / type=3) -> HAOS /media �
 白名单记录带 `source=cloud` / `has_audio` / `usable_for_open=true`，
 集成侧 `_clip_rank()` 把 `_cloud.mp4` 排在 `_sd.mp4` 之前（更高优先级）。
 
-B 路状态（如实说）
-------------------
-换到云回放后 B 路 **依然 100% 绿**。29.92fps ≈ 2×15fps 双路交织，
-360 个 slice 的 `layer_id` 全为 0，排除 SHVC 分层假设。B 路是跨路预测
-还是私有加密（crypt=23）**未验证**，本脚本直接丢弃。
+B 路状态（2026-11-13 16:55–17:05 实测解决，默认关闭）
+--------------------------------------------------------
+根因是**参数集/画幅错配**，不是加密也不是跨路预测：type=3 云回放把
+上摄（1504x1968 竖屏）与下摄（1920x1080 横屏）两路帧奇偶交织进同一条
+HEVC 流，却只带一套 1504x1968 的 SPS。下摄帧被按错误画幅解码 → 全绿。
+把 App 保存的下摄 mp4 里的 VPS/SPS/PPS 换给 B 路帧即可完整解出画面：
+15:05 段 109 帧 / 16:07 段 125 帧，B 路均 0% 绿；交叉对照（A+下摄参数、
+B+云参数）仍 96.8–100% 绿。详见知识库 §23 与 app_samples/ 分析脚本。
+
+`--dual-road` 启用后输出「上摄 | 下摄」左右拼合 + AAC 的同名成品，
+文件名/白名单/前端都不用改；不加该参数时行为与旧版完全一致（只出 A 路）。
 
 用法
 ----
@@ -68,7 +74,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2026-11-13-cloud1"
+VERSION = "2026-11-13-cloud2"
 DEFAULT_REGION_HOST = "https://open.ys7.com"
 REQUEST_TIMEOUT = 20
 PLACEHOLDER_RESOLUTIONS = ("512x288", "512x272", "640x360")
@@ -77,6 +83,16 @@ CLOUD_SUFFIX = "_cloud.mp4"
 
 HA_CONFIG_DIR = Path("/config")
 HA_MEDIA_DIR = Path("/media/tpcamera/door-lock")
+
+# 下摄（1920x1080 横屏）的 VPS/SPS/PPS。来源：萤石云 App「保存视频」导出的
+# b.mp4（下摄/脚部视角），2026-11-13 16:49 主人提供；从 hvcC/Annex-B 提取。
+# 云回放只带上摄的 1504x1968 SPS，B 路帧必须换这三元参数集才能正常解码。
+# 已在 15:05 与 16:07 两个不同时间段的云段上交叉验证（见知识库 §23）。
+B_ROAD_PARAMS_HEX = {
+    32: "40010c01ffff0160000003000003000003000003007bac09",
+    33: "4201010160000003000003000003000003007ba003c0801107cb8aad3ba24bb2",
+    34: "4401c072f03b24",
+}
 
 _log_file: str | None = None
 
@@ -486,6 +502,90 @@ def to_playable(ffmpeg: str, h265: Path, out: Path, audio: Path | None,
     raise RuntimeError("H.264 重编码失败（新旧参数均不可用）")
 
 
+def fix_b_road(ffmpeg: str, annexb: Path, workdir: Path) -> tuple[Path, int]:
+    """给下摄（B 路）帧换上 App 下摄文件的 VPS/SPS/PPS，解出 1920x1080 正常画面。
+
+    云回放只有一套 1504x1968 的上摄 SPS，B 路帧按那套解码必然全绿。
+    本函数不动帧数据，只替换参数集，并在每个 IDR 前补一份以便随机seek。
+    """
+    frames: list[bytes] = []
+    for payload, nal_type in iter_annexb_nals(annexb.read_bytes()):
+        if 1 <= nal_type <= 21:
+            frames.append(payload)
+    b_frames = frames[1::2]
+    if len(b_frames) < 15:
+        raise RuntimeError(f"B 路只有 {len(b_frames)} 帧，不足以成片")
+
+    start_code = b"\x00\x00\x00\x01"
+    head = b"".join(start_code + bytes.fromhex(B_ROAD_PARAMS_HEX[t])
+                     for t in (32, 33, 34))
+    buf = bytearray(head)
+    for f in b_frames:
+        if ((f[0] >> 1) & 0x3F) in (19, 20, 21):
+            buf += head
+        buf += start_code + f
+    out = workdir / "stream_B_fixed.h265"
+    out.write_bytes(bytes(buf))
+    n, ratio = green_frame_ratio(ffmpeg, out)
+    log(f"  B 路修复：{len(b_frames)} 个 NAL -> {n} 帧，绿帧 {ratio * 100:.2f}%")
+    if n < 15 or ratio > 0.02:
+        raise RuntimeError(f"B 路修复后仍不合格（{n} 帧 / 绿 {ratio * 100:.2f}%）")
+    return out, n
+
+
+def to_playable_dual(ffmpeg: str, h265_a: Path, h265_b: Path, out: Path,
+                     audio: Path | None, fps: int = 15,
+                     height: int = 720) -> bool:
+    """上摄 | 下摄 左右拼合，H.264 + 可选 AAC。文件名与单路成品一致。"""
+    w_b = round(height * 16 / 9)
+    filt = (f"[0:v]scale=-2:{height},setsar=1[up];"
+            f"[1:v]scale={w_b}:{height},setsar=1[dn];"
+            "[up][dn]hstack=inputs=2,format=yuv420p[v]")
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+           "-r", str(fps), "-i", str(h265_a),
+           "-r", str(fps), "-i", str(h265_b)]
+    if audio is not None:
+        cmd += ["-i", str(audio)]
+    cmd += ["-filter_complex", filt, "-map", "[v]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-pix_fmt", "yuv420p"]
+    if audio is not None:
+        cmd += ["-map", "2:a:0", "-c:a", "copy"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-movflags", "+faststart", "-f", "mp4", str(out)]
+    # 输入已用 -r 固定 15fps，输出不再加 -r / -fps_mode，避免 ffmpeg 9 的
+    # "non-CFR -vsync 与 -r 冲突"。两路帧数相同，天然对齐。
+    if out.exists():
+        out.unlink()
+    res = subprocess.run(cmd, capture_output=True, text=True,
+                         errors="replace", timeout=300)
+    if res.returncode == 0 and out.exists() and out.stat().st_size > MIN_RAW_BYTES:
+        return audio is not None
+    raise RuntimeError(f"双路拼合失败：{(res.stderr or '')[-400:]}")
+
+
+class _WorkDir:
+    """临时工作目录。清理失败只影响磁盘残留，不该让已成功的补录变成失败。
+
+    本机 Windows 的 Python 安全删除 shim 会在 rmtree 时抛 OSError，
+    TemporaryDirectory 的 ignore_cleanup_errors 也拦不住；HAOS 无此问题。
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.path = Path(tempfile.mkdtemp(prefix="ezviz_cloud_", dir=str(root)))
+
+    def __enter__(self) -> Path:
+        return self.path
+
+    def __exit__(self, *exc) -> bool:
+        try:
+            shutil.rmtree(self.path)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
 def _md5(path: Path) -> str:
     h = hashlib.md5()
     with path.open("rb") as f:
@@ -594,6 +694,10 @@ def main() -> int:
     ap.add_argument("--no-lock", action="store_true")
     ap.add_argument("--no-index", action="store_true")
     ap.add_argument("--keep-raw", action="store_true", help="保留 -c copy 的 .mkv 原件")
+    ap.add_argument("--dual-road", action="store_true",
+                    help="输出上摄+下摄左右拼合的双路成品（默认关闭＝只出 A 路）")
+    ap.add_argument("--dual-height", type=int, default=720,
+                    help="双路拼合后的画面高度，默认 720")
     args = ap.parse_args()
 
     set_log_file(args.log_file or os.environ.get("EZVIZ_LOG_FILE") or None)
@@ -715,8 +819,7 @@ def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
             continue
         log(f"[{idx}/{len(todo)}] {start:%m-%d %H:%M:%S} 时长 {duration}s -> {out_mp4}")
         good = False
-        with tempfile.TemporaryDirectory(prefix="ezviz_cloud_", dir=str(work_root)) as td:
-            wd = Path(td)
+        with _WorkDir(work_root) as wd:
             raw_mkv = wd / f"{stem}.mkv"
             for attempt in range(1, args.retry + 2):
                 try:
@@ -741,7 +844,24 @@ def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
                         if not extract_audio(ffmpeg, raw_mkv, audio_m4a):
                             log("  音轨抽取失败，本段退化为无声音（不影响画面）")
                             audio_m4a = None
-                    has_audio = to_playable(ffmpeg, h265, out_mp4, audio_m4a)
+                    dual_done = False
+                    if args.dual_road:
+                        try:
+                            a_h265 = wd / "stream_A.h265"
+                            n_a, g_a = green_frame_ratio(ffmpeg, a_h265)
+                            if n_a < 15 or g_a > 0.02:
+                                raise RuntimeError(
+                                    f"A 路不干净（{n_a} 帧 / 绿 {g_a * 100:.2f}%）")
+                            b_fixed, n_b = fix_b_road(ffmpeg, wd / "raw.h265", wd)
+                            has_audio = to_playable_dual(
+                                ffmpeg, a_h265, b_fixed, out_mp4, audio_m4a,
+                                height=args.dual_height)
+                            desc = f"双路拼合 上摄 {n_a} 帧 + 下摄 {n_b} 帧"
+                            dual_done = True
+                        except Exception as err:  # noqa: BLE001
+                            log(f"  双路拼合失败，回退单路 A：{err}")
+                    if not dual_done:
+                        has_audio = to_playable(ffmpeg, h265, out_mp4, audio_m4a)
 
                     n, green = green_frame_ratio(ffmpeg, out_mp4)
                     if n == 0 or n < 15 or green > 0.02:
