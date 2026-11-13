@@ -1,15 +1,23 @@
 #!/bin/sh
 # 门锁「云存储录像」补录（recType=1 / type=3）—— HA 侧入口
 #   run_ezviz_cloud_pull.sh [--bg] [脚本参数...]
-#   与本包装器同目录的 ezviz_cloud_pull.py；HACS 安装后目录固定为
-#   /config/custom_components/ezviz_lock/tools/ ，不用手工复制到 /config/scripts/。
+#   --bg：后台运行后立即返回（给 shell_command / 自动化用，避开 60 秒上限）
+#   与 SD 链路完全独立：不同脚本、不同日志、不同锁文件、不同节流状态
 set -u
 
 BG=0
 if [ "${1:-}" = "--bg" ]; then BG=1; shift; fi
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-SCRIPT="$SCRIPT_DIR/ezviz_cloud_pull.py"
+# 2026-11-13 17:28 主人确认启用：上摄在上 / 下摄在下的双路拼合。
+# 一键回退：把 DUAL_ROAD 改成 0 即可恢复单路 A，不用动 configuration.yaml，
+# 也不用重启 HA（shell_command 的命令字符串没变，下次触发即生效）。
+DUAL_ROAD=1
+case " $* " in
+  *" --check "*) ;;                 # --check 自检不注入
+  *) [ "$DUAL_ROAD" = "1" ] && set -- "$@" --dual-road || true ;;
+esac
+
+SCRIPT=/config/scripts/ezviz_cloud_pull.py
 LOG_DIR=/config/logs
 LOG="$LOG_DIR/ezviz_cloud_pull.log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
