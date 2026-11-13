@@ -1,0 +1,96 @@
+refresh:
+  name: 立即刷新
+  description: 立刻从萤石云拉取一次开门记录，不等下一个轮询周期。
+  fields:
+    config_entry_id:
+      name: 配置条目
+      description: 多台门锁时指定条目 ID，留空则刷新全部。
+      example: 01HXXXXXXXXXXXXXXX
+      selector:
+        text:
+
+download_clip:
+  name: 下载录像
+  description: 把指定开门事件的云录像下载到本地 /local/ezviz_lock/clips/，并返回可直接播放的地址。
+  fields:
+    open_time:
+      name: 开门时间
+      description: 事件的 open_time（ISO 格式，可从传感器属性取）。留空则取最近一条。
+      example: "2026-11-10T19:20:31+08:00"
+      selector:
+        text:
+    index:
+      name: 倒数第几条
+      description: 0 表示最近一条，1 表示上一条，以此类推。
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 49
+          mode: box
+    config_entry_id:
+      name: 配置条目
+      description: 多台门锁时指定条目 ID。
+      selector:
+        text:
+
+get_playback_url:
+  name: 获取回放地址
+  description: 返回指定开门事件的可播放地址（优先本地 mp4，其次云端 MP4 点播地址）。
+  fields:
+    open_time:
+      name: 开门时间
+      description: 事件的 open_time（ISO 格式）。留空则取最近一条。
+      selector:
+        text:
+    index:
+      name: 倒数第几条
+      description: 0 表示最近一条。
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 49
+          mode: box
+    config_entry_id:
+      name: 配置条目
+      description: 多台门锁时指定条目 ID。
+      selector:
+        text:
+
+refetch_loiter:
+  name: 重取徘徊录像
+  description: 把还没取到录像（含被判为占位提示画面）的徘徊事件重新排一次取流。
+  fields:
+    config_entry_id:
+      name: 配置条目
+      description: 多台门锁时指定条目 ID，留空则处理全部。
+      selector:
+        text:
+    force:
+      name: 强制重取
+      description: 连已存在的录像文件一起丢弃重取（用于清掉早期的占位提示画面）。
+      default: false
+      selector:
+        boolean:
+
+delete_loiter:
+  name: 删除徘徊记录
+  description: 删除指定的一条徘徊唤醒记录，并一并删除它对应的录像与抓拍图。删除后该告警不会再被云端轮询拉回来，操作不可恢复。
+  fields:
+    uid:
+      name: 告警 ID
+      description: 徘徊事件的 uid / alarm_id，优先用它定位（最精确）。
+      selector:
+        text:
+    time_ms:
+      name: 事件时间戳
+      description: 徘徊事件的 time_ms（毫秒）；uid 留空时用它定位。可从传感器属性 loiter_events 取。
+      example: 1762926000000
+      selector:
+        text:
+    config_entry_id:
+      name: 配置条目
+      description: 多台门锁时指定条目 ID，留空则处理全部。
+      selector:
+        text:

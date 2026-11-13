@@ -1,0 +1,35 @@
+- id: '1794500000001'
+  alias: 门锁 SD 录像补录（开门即补 + 30 分钟兜底）
+  description: 门锁一有开门事件就补一段（先等 3 分钟让设备把这段封口）；另每 30 分钟兜底一次。脚本自带进程锁与 10 分钟最小取流间隔（防密集触发打爆回放通道），通道异常会整批中止
+  triggers:
+  - trigger: time_pattern
+    minutes: /30
+    id: scan
+  - trigger: state
+    entity_id: event.y3000fvx_plus_yourserial_door_open_event
+    not_to:
+    - unknown
+    - unavailable
+    id: door_event
+  - trigger: state
+    entity_id: sensor.your_ezviz_lock_loiter_alerts_today
+    not_to:
+    - unknown
+    - unavailable
+    id: loiter_event
+  conditions:
+  - condition: template
+    value_template: "{% set tid = trigger.id | default('scan') %} {{ tid == 'scan'\n   or (tid == 'door_event' and trigger.to_state is defined\n       and trigger.to_state.attributes.get('event_type') !=\
+      \ 'open_close')\n   or (tid == 'loiter_event' and trigger.from_state is defined and trigger.to_state is defined\n       and (trigger.to_state.state | int(0)) > (trigger.from_state.state | int(0)))\
+      \ }}"
+  actions:
+  - if:
+    - condition: template
+      value_template: '{{ trigger.id in ["door_event", "loiter_event"] }}'
+    then:
+    - delay:
+        seconds: 180
+  - action: shell_command.ezviz_sd_pull
+    data: {}
+  mode: queued
+  max: 2

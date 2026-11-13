@@ -1,0 +1,127 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to EZVIZ Open Platform",
+        "description": "Enter the AppKey / AppSecret of your EZVIZ Open Platform application, plus the lock's device serial number (9 digits, uppercase letters).",
+        "data": {
+          "app_key": "AppKey",
+          "app_secret": "AppSecret",
+          "device_serial": "Device serial",
+          "channel_no": "Channel number",
+          "region_host": "API region"
+        }
+      },
+      "confirm": {
+        "title": "Door-open record API not available",
+        "description": "Device {name} is reachable, but the door-open record API returned a permission error.\n\n{warning}\n\nClick submit to continue anyway."
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid AppKey / AppSecret",
+      "device_not_owned": "This device is not bound to the account that owns the AppKey",
+      "cannot_connect": "Cannot reach the EZVIZ Open Platform"
+    },
+    "abort": {
+      "already_configured": "This device is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EZVIZ Lock options",
+        "description": "Alarm type name mapping: one `code:name` per line, e.g. `10019:Loitering`. Leave empty to use built-in defaults.",
+        "data": {
+          "scan_interval": "Polling interval (seconds)",
+          "merge_window": "Pass-through merge window (seconds)",
+          "snapshot_retention": "Media retention (days)",
+          "channel_no": "Channel number",
+          "auto_download_clip": "Auto-download clips after door opens",
+          "alarm_type_names": "Alarm type name mapping"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "last_open_user": {
+        "name": "Last opened by"
+      },
+      "last_open_time": {
+        "name": "Last open time"
+      },
+      "last_open_type": {
+        "name": "Last unlock method"
+      },
+      "person_count": {
+        "name": "Last pass-through headcount"
+      },
+      "today_open_count": {
+        "name": "Opens today"
+      },
+      "loiter_count": {
+        "name": "Loiter alerts today"
+      }
+    },
+    "image": {
+      "last_snapshot": {
+        "name": "Last open snapshot"
+      }
+    },
+    "event": {
+      "door_event": {
+        "name": "Door open event"
+      }
+    }
+  },
+  "services": {
+    "refresh": {
+      "name": "Refresh now",
+      "description": "Fetch door-open records immediately."
+    },
+    "download_clip": {
+      "name": "Download clip",
+      "description": "Download the cloud clip of a door-open event to /local/ezviz_lock/clips/ and return a playable URL.",
+      "fields": {
+        "open_time": {
+          "name": "Open time",
+          "description": "Event ISO open_time, defaults to the latest"
+        },
+        "index": {
+          "name": "Offset",
+          "description": "0 = latest, 1 = previous"
+        },
+        "config_entry_id": {
+          "name": "Config entry",
+          "description": "Config entry id when multiple locks exist"
+        }
+      }
+    },
+    "get_playback_url": {
+      "name": "Get playback URL",
+      "description": "Return a playable URL for a door-open event (local mp4 first, then cloud VOD).",
+      "fields": {
+        "open_time": {
+          "name": "Open time",
+          "description": "Event ISO open_time, defaults to the latest"
+        },
+        "index": {
+          "name": "Offset",
+          "description": "0 = latest"
+        },
+        "config_entry_id": {
+          "name": "Config entry",
+          "description": "Config entry id when multiple locks exist"
+        }
+      }
+    },
+    "refetch_loiter": {
+      "name": "Re-fetch loiter clips",
+      "description": "Re-queue loiter events that have no clip (including placeholder images)."
+    },
+    "delete_loiter": {
+      "name": "Delete loiter record",
+      "description": "Delete one loiter event together with its clip and snapshot. This cannot be undone."
+    }
+  }
+}

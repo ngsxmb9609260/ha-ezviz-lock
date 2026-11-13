@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地运行产物（绝不入库）
+*.mp4
+*.mkv
+*.h265
+*.log
+clean_clips.json
+.pull_state.json
+.pull_failures.json
+.pull.lock
+.work/
+snapshots/
+live/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 含真实密钥与本机路径的配置，仅作示例文件保留，禁止提交实际副本
+.storage/
+secrets.yaml

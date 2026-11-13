@@ -1,0 +1,128 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "连接萤石开放平台",
+        "description": "填入萤石开放平台应用的 AppKey / AppSecret，以及门锁的设备序列号（9 位，如 427734203，字母需大写）。\n\nAppKey 获取：open.ys7.com → 控制台 → 应用管理 → 创建应用。\n设备序列号获取：萤石 App → 设备设置 → 设备信息，或开放平台控制台设备列表。",
+        "data": {
+          "app_key": "AppKey",
+          "app_secret": "AppSecret",
+          "device_serial": "设备序列号",
+          "channel_no": "通道号",
+          "region_host": "接口区域"
+        }
+      },
+      "confirm": {
+        "title": "开门记录接口权限不足",
+        "description": "设备 {name} 已连接成功，但开门记录接口返回权限错误。\n\n{warning}\n\n点「提交」继续添加，点关闭则放弃。"
+      }
+    },
+    "error": {
+      "invalid_auth": "AppKey / AppSecret 无效，请检查开放平台应用信息",
+      "device_not_owned": "该 AppKey 所属账号下没有这台设备，请先在萤石 App 中确认设备归属",
+      "cannot_connect": "无法连接萤石开放平台，请检查网络与区域节点"
+    },
+    "abort": {
+      "already_configured": "该设备已经添加过了"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EZVIZ Lock 选项",
+        "description": "告警类型名称映射格式：每行一个 `数值:名称`，例如 `10019:徘徊检测`。留空则使用内置常见映射。",
+        "data": {
+          "scan_interval": "轮询间隔（秒）",
+          "merge_window": "同一次通行的聚合窗口（秒）",
+          "snapshot_retention": "抓拍图/录像保留天数",
+          "channel_no": "通道号",
+          "auto_download_clip": "开门后自动下载录像到本地",
+          "alarm_type_names": "告警类型名称映射",
+          "user_aliases": "用户别名映射（锁上原名=显示名，如 用户1=爸爸,用户=妈妈）"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "last_open_user": {
+        "name": "最近开门人员"
+      },
+      "last_open_time": {
+        "name": "最近开门时间"
+      },
+      "last_open_type": {
+        "name": "最近开锁方式"
+      },
+      "person_count": {
+        "name": "最近通行人数"
+      },
+      "today_open_count": {
+        "name": "今日开门次数"
+      },
+      "loiter_count": {
+        "name": "今日徘徊唤醒次数"
+      }
+    },
+    "image": {
+      "last_snapshot": {
+        "name": "最近开门抓拍"
+      }
+    },
+    "event": {
+      "door_event": {
+        "name": "开门事件"
+      }
+    }
+  },
+  "services": {
+    "refresh": {
+      "name": "立即刷新",
+      "description": "立刻从萤石云拉取一次开门记录。"
+    },
+    "download_clip": {
+      "name": "下载录像",
+      "description": "把指定开门事件的云录像下载到本地 /local/ezviz_lock/clips/ 并返回可播放地址。",
+      "fields": {
+        "open_time": {
+          "name": "开门时间",
+          "description": "事件的 open_time（ISO 格式），留空则取最近一条"
+        },
+        "index": {
+          "name": "倒数第几条",
+          "description": "0 表示最近一条，1 表示上一条"
+        },
+        "config_entry_id": {
+          "name": "配置条目",
+          "description": "多设备时指定条目 ID"
+        }
+      }
+    },
+    "get_playback_url": {
+      "name": "获取回放地址",
+      "description": "返回指定开门事件的可播放地址（优先本地 mp4，其次云端点播地址）。",
+      "fields": {
+        "open_time": {
+          "name": "开门时间",
+          "description": "事件的 open_time（ISO 格式），留空则取最近一条"
+        },
+        "index": {
+          "name": "倒数第几条",
+          "description": "0 表示最近一条"
+        },
+        "config_entry_id": {
+          "name": "配置条目",
+          "description": "多设备时指定条目 ID"
+        }
+      }
+    },
+    "refetch_loiter": {
+      "name": "重取徘徊录像",
+      "description": "把还没取到录像（含被判为占位提示画面）的徘徊事件重新排一次取流。"
+    },
+    "delete_loiter": {
+      "name": "删除徘徊记录",
+      "description": "删除指定的一条徘徊唤醒记录，并一并删除它对应的录像与抓拍图。操作不可恢复。"
+    }
+  }
+}

@@ -1,0 +1,342 @@
+title: 门锁
+views:
+- title: 总览
+  path: overview
+  icon: mdi:door-closed-lock
+  panel: true
+  cards:
+  - type: custom:ezviz-door-lock-panel
+    entity: sensor.y3000fvx_plus_yourserial_opens_today
+    list: recent_events
+    max: 30
+- title: 今日明细
+  path: today
+  icon: mdi:format-list-numbered
+  cards:
+  - type: markdown
+    content: '{% set ev = state_attr(''sensor.y3000fvx_plus_yourserial_opens_today'',''today_events'') or [] %}
+
+      {% if ev %}
+
+      {% set names = ev | map(attribute=''user_name'') | unique | list %}
+
+      {% set methods = ev | map(attribute=''open_type_name'') | unique | list %}
+
+      **今日开门 {{ ev|length }} 次**
+
+
+      | 人员 | 次数 |
+
+      |:---|:---:|
+
+      {% for n in names %}| {{ n }} | {{ ev | selectattr(''user_name'',''equalto'',n) | list | count }} 次 |
+
+      {% endfor %}
+
+
+      | 开门方式 | 次数 |
+
+      |:---|:---:|
+
+      {% for m in methods %}| {{ m }} | {{ ev | selectattr(''open_type_name'',''equalto'',m) | list | count }} 次 |
+
+      {% endfor %}
+
+      {% else %}
+
+      ### 今天还没有开门记录
+
+      {% endif %}
+
+      '
+  - type: markdown
+    content: '## 全部记录'
+  - type: markdown
+    content: '{% set ev = state_attr(''sensor.y3000fvx_plus_yourserial_opens_today'',''today_events'') or [] %}
+
+      {% if ev %}
+
+      | 抓拍 | 时间 | 人员 | 方式 | 人数 | 视频 |
+
+      |:---:|:---|:---|:---|---:|:---:|
+
+      {% for e in ev %}| {% if e.snapshot_url %}<a href="{{ e.snapshot_url }}" target="_blank" rel="noopener"><img src="{{ e.snapshot_url }}" width="96" style="border-radius:6px" /></a>{% else %}<span style="color:var(--secondary-text-color);font-size:18px">—</span>{% endif %} | {% if e.snapshot_url %}<a href="{{ e.snapshot_url }}" target="_blank" rel="noopener" style="text-decoration:none;font-weight:600">{{ as_timestamp(e.open_time)|timestamp_custom(''%H:%M:%S'') }}</a>{% else %}{{ as_timestamp(e.open_time)|timestamp_custom(''%H:%M:%S'') }}{% endif %} | **{{ e.user_name }}** | {{ e.open_type_name }} | {{ e.person_count }}{% if e.person_count_source == ''default'' %}<small>*</small>{% endif %} | {% if e.clip_url %}<a href="{{ e.clip_url }}" target="_blank" rel="noopener" title="SD 卡回放录像：按开门时刻校对，逐帧无绿验收" style="text-decoration:none"><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:var(--primary-color);color:#fff;font-size:11px;white-space:nowrap">▶ SD录像</span></a>{%
+      else %}<span style="color:var(--secondary-text-color)">—</span>{% endif %} |
+
+      {% endfor %}
+
+
+      <small style="color:var(--secondary-text-color)">左侧缩略图 = 该次开门画面，点图片或点时间都能看原图（新标签页）· 最右「SD录像」= SD 卡回放下载、按开门时刻校对，没有对应录像显示 — · 带 * 的人数为占位估算</small>
+
+      {% else %}
+
+      暂无记录
+
+      {% endif %}
+
+      '
+  - type: markdown
+    content: '{% set lo = state_attr(''sensor.your_ezviz_lock_loiter_alerts_today'',''loiter_events'') or [] %}
+
+      {% set today = now().strftime(''%Y-%m-%d'') %}
+
+      {% set ns = namespace(items=[]) %}
+
+      {% for x in lo %}{% if x.time[:10] == today %}{% set ns.items = ns.items + [x] %}{% endif %}{% endfor %}
+
+      {% set tl = ns.items %}
+
+      ### 徘徊唤醒
+
+      {% if tl %}
+
+      **今日 {{ tl|length }} 次**（有人靠近但没开门）
+
+
+      | 抓拍 | 时间 | 时长 | 视频 |
+
+      |:---:|:---|:---:|:---:|
+
+      {% for x in tl %}| {% if x.snapshot_url %}<a href="{{ x.snapshot_url }}" target="_blank" rel="noopener"><img src="{{ x.snapshot_url }}" width="96" style="border-radius:6px" /></a>{% else %}<span style="color:var(--secondary-text-color);font-size:18px">—</span>{% endif %} | {{ as_timestamp(x.time)|timestamp_custom(''%H:%M:%S'') }} | {{ x.duration_s }}s | {% if x.clip_url %}<a href="{{ x.clip_url }}" target="_blank" rel="noopener" title="SD 卡回放录像：按徘徊时刻校对，逐帧无绿验收" style="text-decoration:none"><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:var(--primary-color);color:#fff;font-size:11px;white-space:nowrap">▶ SD录像</span></a>{% else %}<span style="color:var(--secondary-text-color)">—</span>{% endif %} |
+
+      {% endfor %}
+
+
+      <small style="color:var(--secondary-text-color)">徘徊 = 有人靠近但没开门。录像同样来自 SD 卡回放下载、按徘徊时刻校对（±45 秒内找不到对应段就显示 —，绝不用别时段的片顶替）</small>
+
+      {% else %}
+
+      暂无徘徊唤醒
+
+      {% endif %}'
+  - type: button
+    name: 返回总览
+    icon: mdi:arrow-left
+    tap_action:
+      action: navigate
+      navigation_path: /door-lock/overview
+- title: 抓拍
+  path: album
+  icon: mdi:image-multiple
+  cards:
+  - type: markdown
+    content: '{% set ev = state_attr(''sensor.y3000fvx_plus_yourserial_opens_today'',''recent_events'') or [] %}
+
+      {% set pics = ev | selectattr(''snapshot_url'') | list %}
+
+      {% if pics %}
+
+      **最近抓拍 {{ pics|length }} 张** · 点任意图片查看原图
+
+
+      |  |  |  |
+
+      |:---:|:---:|:---:|
+
+      {% for row in pics|batch(3, {}) %}|{% for e in row %}{% if e.snapshot_url %}<a href="{{ e.snapshot_url }}" target="_blank" rel="noopener"><img src="{{ e.snapshot_url }}" width="200" style="border-radius:8px" /></a><br><b>{{ as_timestamp(e.open_time)|timestamp_custom(''%m-%d %H:%M'') }}</b><br>{{ e.user_name }} · {{ e.open_type_name }}{% if e.snapshot_source not in (''alarm'',''cache'') %}<br><small>📷 补拍</small>{% endif %} |{% else %} |{% endif %}{% endfor %}
+
+      {% endfor %}
+
+
+      <small style="color:var(--secondary-text-color)">🖼 告警原图 = 事发当刻；📷 补拍 = 发现记录后立刻抓拍，可能晚几秒</small>
+
+      {% else %}
+
+      暂时没有抓拍图。若刚开门还没出图，等一个轮询周期（20 秒）再刷新。
+
+      {% endif %}
+
+      '
+  - type: button
+    name: 返回总览
+    icon: mdi:arrow-left
+    tap_action:
+      action: navigate
+      navigation_path: /door-lock/overview
+- title: 历史记录
+  path: history
+  icon: mdi:history
+  cards:
+  - type: history-graph
+    title: 开门次数变化（48 小时）
+    hours_to_show: 48
+    entities:
+    - entity: sensor.y3000fvx_plus_yourserial_opens_today
+      name: 今日开门次数
+  - type: logbook
+    title: 开门事件日志（48 小时）
+    hours_to_show: 48
+    entities:
+    - event.y3000fvx_plus_yourserial_door_open_event
+    - sensor.y3000fvx_plus_yourserial_last_opened_by
+  - type: markdown
+    content: '{% set ev = state_attr(''sensor.y3000fvx_plus_yourserial_opens_today'',''recent_events'') or [] %}
+
+      {% if ev %}
+
+      | 抓拍 | 时间 | 人员 | 开门方式 | 视频 |
+
+      |:---:|:---|:---|:---|:---:|
+
+      {% for e in ev %}| {% if e.snapshot_url %}<a href="{{ e.snapshot_url }}" target="_blank" rel="noopener"><img src="{{ e.snapshot_url }}" width="88" style="border-radius:6px" /></a>{% else %}<span style="color:var(--secondary-text-color);font-size:18px">—</span>{% endif %} | {% if e.snapshot_url %}<a href="{{ e.snapshot_url }}" target="_blank" rel="noopener" style="text-decoration:none;font-weight:600">{{ as_timestamp(e.open_time)|timestamp_custom(''%m-%d %H:%M:%S'') }}</a>{% else %}{{ as_timestamp(e.open_time)|timestamp_custom(''%m-%d %H:%M:%S'') }}{% endif %}{% if e.snapshot_url %}<br><small>{% if e.snapshot_source in (''alarm'',''cache'') %}🖼 原图{% else %}📷 补拍{% endif %}</small>{% endif %} | {{ e.user_name }} | {{ e.open_type_name }} | {% if e.clip_url %}<a href="{{ e.clip_url }}" target="_blank" rel="noopener" title="SD 卡回放录像：按开门时刻校对，逐帧无绿验收" style="text-decoration:none"><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:var(--primary-color);color:#fff;font-size:11px;white-space:nowrap">▶
+      SD录像</span></a>{% else %}<span style="color:var(--secondary-text-color)">—</span>{% endif %} |
+
+      {% endfor %}
+
+      {% else %}
+
+      暂无开门记录
+
+      {% endif %}
+
+
+      <small style="color:var(--secondary-text-color)">跨天最近 {{ ev|length }} 条开门记录；点缩略图或时间查看原图，最右「SD录像」= SD 卡回放下载、按开门时刻校对，没有对应录像显示 —。只看今天请到「今日明细」</small>
+
+      '
+- title: 设备信息
+  path: device
+  icon: mdi:information-outline
+  cards:
+  - type: entities
+    title: 全部实体
+    entities:
+    - entity: sensor.y3000fvx_plus_yourserial_last_opened_by
+      name: 最近开门人员
+    - entity: sensor.y3000fvx_plus_yourserial_last_open_time
+      name: 最近开门时间
+    - entity: sensor.y3000fvx_plus_yourserial_last_unlock_method
+      name: 最近开锁方式
+    - entity: sensor.y3000fvx_plus_yourserial_last_pass_through_headcount
+      name: 最近通行人数
+    - entity: sensor.y3000fvx_plus_yourserial_opens_today
+      name: 今日开门次数
+    - entity: image.y3000fvx_plus_yourserial_last_open_snapshot
+      name: 最近开门抓拍
+    - entity: event.y3000fvx_plus_yourserial_door_open_event
+      name: 开门事件
+  - type: markdown
+    content: '## 设备
+
+
+      | 项目 | 值 |
+
+      |:---|:---|
+
+      | 名称 | 你的门锁名称 |
+
+      | 型号 | CS-Y3000FVX-Plus-V210-B |
+
+      | 序列号 | 你的设备序列号 |
+
+      | 集成 | EZVIZ Lock |
+
+      | 通道 | 1 |
+
+      | 轮询间隔 | 20 秒 |
+
+      | 最近一次关门 | {{ state_attr(''sensor.y3000fvx_plus_yourserial_opens_today'',''last_close_time'') or ''—'' }} |
+
+
+      ## 当前事件完整字段
+
+
+      ```yaml
+
+      open_time: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''open_time'') or ''—'' }}
+
+      user_name: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''user_name'') or ''—'' }}
+
+      open_type: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''open_type'') }}
+
+      open_type_name: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''open_type_name'') or ''—'' }}
+
+      person_count: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''person_count'') }}
+
+      person_count_source: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''person_count_source'') or ''—'' }}
+
+      snapshot_url: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''snapshot_url'') or ''—'' }}
+
+      snapshot_source: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''snapshot_source'') or ''—'' }}
+
+      snapshot_delay_s: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''snapshot_delay_s'') }}
+
+      alarm_type: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''alarm_type'') or ''—'' }}
+
+      alarm_type_name: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''alarm_type_name'') or ''—'' }}
+
+      event_uid: {{ state_attr(''sensor.y3000fvx_plus_yourserial_last_opened_by'',''event_uid'') or ''—'' }}
+
+      has_snapshot: {{ state_attr(''image.y3000fvx_plus_yourserial_last_open_snapshot'',''has_snapshot'') }}
+
+      ```
+
+      '
+  - type: markdown
+    content: '## 说明与排错
+
+
+      **统计口径**（以前数字偏小，已修正）：
+
+
+      - **今日开门** = 今天所有真实开锁记录条数（指纹/密码/卡/临时密码/人脸/室内/远程/掌静脉/机械钥匙）。数据来自云端 `keylock/open/list`，每次启动都会按今日全量重建，重启不丢。
+
+      - **今日关门** = `openType=9` 的记录**去重后**条数。这台锁会在几秒内重复上报关门（实测 18:01:59 与 18:02:05 连报两条），不去重会出现「关门次数 > 开门次数」。
+
+      - 点总览页的统计卡 → 进入「今日明细」，列出今天每一次开门的完整记录。
+
+
+      **人员姓名从哪来**：设备上报名是 `用户1`/`用户2`/`用户`，这里显示的是 **HA 端的别名映射**（集成 → 配置 → 用户别名映射），格式 `用户1=爸爸,用户2=妈妈`。改完自动重载，历史记录也会一起改名。
+
+
+      > 不用去萤石 App 改名：这把锁的用户是锁上本地录入的，云端 `keylock/user/list` 返回空，App 里改了接口侧也未必同步。
+
+
+      **openType=9 是「关门」**：萤石官方文档只定义到 8（0 指纹 / 1 密码 / 2 门卡 / 3 临时密码 / 4 人脸 / 5 室内开门 / 6 远程 / 7 掌静脉 / 8 机械钥匙）。实测发现每条真实开门后 4~12 秒必出现一条 `openType=9` 且无用户名的记录，判定为关门事件。本页已把关门与开门分开统计，所以不会再出现满屏「未知用户」。
+
+
+      **图片存放在哪**：`/media/tpcamera/door-lock/日期/时刻_方式.jpg`
+
+
+      - 放在**额外存储**（`/media`），不进 `config`，也不占 HA 备份空间
+
+      - **每个事件只保留一张图**；换成更准的图（如告警原图）时，旧的补拍图会自动删除
+
+      - 前端访问靠 HA 的签名地址（`?authSig=...`，有效期 10 年），不需要登录也能直接看
+
+
+      **取图策略**（省接口调用）：
+
+
+      1. 本地**已经有图** → 永远不再从云端取
+
+      2. 本地没有图 → 从云端取**一次**
+
+      3. 云端也没有（那一刻设备就没上报告警）→ 记录下来，**以后不再尝试**
+
+
+      **抓拍图的两个来源**：
+
+
+      - `告警原图` — 来自萤石告警消息，是事发当刻的画面，最准
+
+      - `📷 补拍` — 发现新开门后立刻调设备抓拍一张。因为轮询有延迟，图会比真实开门晚几秒到几十秒，人可能已经进门
+
+      - 室内按键开门（室内开门 / 机械钥匙）不产生门外画面，所以**本来就没有图**，不是漏抓
+
+
+      **人数为什么不准**：萤石开放平台**没有**「画面人数」接口。`person_count_source` 会标明来源：`customer_info`（设备透传，最准）/ `face_ids`（人脸去重）/ `default`（按 1 人占位，**不代表真的 1 人**）。
+
+
+      **服务**（开发者工具 → 操作 里调用）：
+
+
+      - `ezviz_lock.refresh` — 立即拉取一次，不等轮询
+
+      - `ezviz_lock.download_clip` — 参数 `index: 0` 下载最近一条录像到 `/media/tpcamera/door-lock/clips/`
+
+      - `ezviz_lock.get_playback_url` — 参数 `index: 0` 返回可播放地址
+
+
+      **录像**：设备本地有告警录像（实测可查到分段），但开放平台不提供本地录像的下载地址；云录像需要订阅云存储。抓拍图不受此限制。
+
+      '
