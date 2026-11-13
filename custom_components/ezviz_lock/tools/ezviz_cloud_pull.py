@@ -40,8 +40,9 @@ HEVC 流，却只带一套 1504x1968 的 SPS。下摄帧被按错误画幅解码
 15:05 段 109 帧 / 16:07 段 125 帧，B 路均 0% 绿；交叉对照（A+下摄参数、
 B+云参数）仍 96.8–100% 绿。详见知识库 §23 与 app_samples/ 分析脚本。
 
-`--dual-road` 启用后输出「上摄 | 下摄」左右拼合 + AAC 的同名成品，
-文件名/白名单/前端都不用改；不加该参数时行为与旧版完全一致（只出 A 路）。
+`--dual-road` 启用后输出「上摄在上 / 下摄在下」垂直拼合 + AAC 的同名成品
+（默认总宽 720，`--dual-width` 可调），文件名/白名单/前端都不用改；
+不加该参数时行为与旧版完全一致（只出 A 路）。
 
 用法
 ----
@@ -535,12 +536,15 @@ def fix_b_road(ffmpeg: str, annexb: Path, workdir: Path) -> tuple[Path, int]:
 
 def to_playable_dual(ffmpeg: str, h265_a: Path, h265_b: Path, out: Path,
                      audio: Path | None, fps: int = 15,
-                     height: int = 720) -> bool:
-    """上摄 | 下摄 左右拼合，H.264 + 可选 AAC。文件名与单路成品一致。"""
-    w_b = round(height * 16 / 9)
-    filt = (f"[0:v]scale=-2:{height},setsar=1[up];"
-            f"[1:v]scale={w_b}:{height},setsar=1[dn];"
-            "[up][dn]hstack=inputs=2,format=yuv420p[v]")
+                     width: int = 720) -> bool:
+    """上摄(A)在上、下摄(B)在下垂直拼合，H.264 + 可选 AAC。文件名与单路成品一致。
+
+    两路原始画幅不同（1504x1968 竖屏 / 1920x1080 横屏），统一缩放到同一总宽
+    后 vstack；上摄保持主画面比例，下摄按 16:9 自动等比缩放。
+    """
+    filt = (f"[0:v]scale={width}:-2,setsar=1[up];"
+            f"[1:v]scale={width}:-2,setsar=1[dn];"
+            "[up][dn]vstack=inputs=2,format=yuv420p[v]")
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
            "-r", str(fps), "-i", str(h265_a),
            "-r", str(fps), "-i", str(h265_b)]
@@ -696,8 +700,8 @@ def main() -> int:
     ap.add_argument("--keep-raw", action="store_true", help="保留 -c copy 的 .mkv 原件")
     ap.add_argument("--dual-road", action="store_true",
                     help="输出上摄+下摄左右拼合的双路成品（默认关闭＝只出 A 路）")
-    ap.add_argument("--dual-height", type=int, default=720,
-                    help="双路拼合后的画面高度，默认 720")
+    ap.add_argument("--dual-width", type=int, default=720,
+                    help="双路上下拼合后的总宽度，默认 720")
     args = ap.parse_args()
 
     set_log_file(args.log_file or os.environ.get("EZVIZ_LOG_FILE") or None)
@@ -855,8 +859,8 @@ def _run(args, cred: dict, ffmpeg: str, root: Path, state_glob: str) -> int:
                             b_fixed, n_b = fix_b_road(ffmpeg, wd / "raw.h265", wd)
                             has_audio = to_playable_dual(
                                 ffmpeg, a_h265, b_fixed, out_mp4, audio_m4a,
-                                height=args.dual_height)
-                            desc = f"双路拼合 上摄 {n_a} 帧 + 下摄 {n_b} 帧"
+                                width=args.dual_width)
+                            desc = f"双路上下拼合 上摄 {n_a} 帧 + 下摄 {n_b} 帧"
                             dual_done = True
                         except Exception as err:  # noqa: BLE001
                             log(f"  双路拼合失败，回退单路 A：{err}")
