@@ -11,6 +11,23 @@ if [ "${1:-}" = "--bg" ]; then BG=1; shift; fi
 # 脚本与本包装器同目录。HACS 安装后该目录固定为
 # /config/custom_components/ezviz_lock/tools/ ，不需要再手工复制到 /config/scripts/。
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# v1.3.1 起默认「全量双路」：停用 SD 单路产出。
+# 所有调用（开门 / 徘徊 / 30 分钟兜底）改道到云存储双路补录，
+# 由云脚本的进程锁 + 300s 节流负责去重；不改 YAML、不重启 HA。
+# 一键回滚：把 SD_PULL_ENABLED 改成 1 即恢复原来的单路 SD 链路。
+SD_PULL_ENABLED=0
+if [ "$SD_PULL_ENABLED" != "1" ]; then
+  case " $* " in
+    *" --check "*) exec /bin/sh "$SCRIPT_DIR/run_ezviz_cloud_pull.sh" "$@" ;;
+    *) if [ "$BG" = "1" ]; then
+         exec /bin/sh "$SCRIPT_DIR/run_ezviz_cloud_pull.sh" --bg "$@"
+       else
+         exec /bin/sh "$SCRIPT_DIR/run_ezviz_cloud_pull.sh" "$@"
+       fi ;;
+  esac
+fi
+
 SCRIPT="$SCRIPT_DIR/ezviz_sd_pull.py"
 LOG_DIR=/config/logs
 LOG="$LOG_DIR/ezviz_sd_pull.log"
