@@ -16,6 +16,16 @@ shell_command:
     /bin/sh /config/custom_components/ezviz_lock/tools/run_ezviz_pull.sh
     --check --log-file /config/logs/ezviz_check.log
 
+  # 可选：云存储录像回放（type=3）。开门瞬间短片、自带 AAC 音轨、不打扰设备。
+  # 需要设备已开通萤石云存储；与上面的 SD 链路互为兜底，可只启用其中一条。
+  ezviz_cloud_pull: >-
+    /bin/sh /config/custom_components/ezviz_lock/tools/run_ezviz_cloud_pull.sh
+    --bg --limit 1 --event-priority
+
+  ezviz_cloud_pull_check: >-
+    /bin/sh /config/custom_components/ezviz_lock/tools/run_ezviz_cloud_pull.sh
+    --check --log-file /config/logs/ezviz_cloud_check.log
+
 # 说明：
 #  - 脚本默认从 /config/.storage/core.config_entries 读取 AppKey/AppSecret，
 #    那正是本集成 ConfigFlow 写入的位置，所以这里不需要写任何密钥。

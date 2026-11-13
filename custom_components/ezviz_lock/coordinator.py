@@ -1967,10 +1967,17 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
 
     @staticmethod
     def _clip_rank(path: Path) -> int:
-        """录像优先级：独立拉取器的干净 SD 回放 > 集成抓录；废片不认。"""
+        """录像优先级：云存储回放(带声音、精确到秒) > 干净 SD 回放 > 集成抓录；废片不认。
+
+        2026-11-13 新增 `_cloud.mp4`：来自 `ezviz_cloud_pull.py` 的 type=3 云回放，
+        段起点就是开门事件时刻（实测多数只差 0–2 秒），且自带 AAC 音轨。
+        它和 `_sd.mp4` 同走逐帧验收白名单，但优先级更高，能顶替已认领的 SD 片。
+        """
         name = path.name.lower()
         if ".broken." in name:
             return -1
+        if name.endswith("_cloud.mp4"):
+            return 3
         if name.endswith("_sd.mp4"):
             return 2
         return 1
@@ -2079,7 +2086,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 if cur is not None and await self.hass.async_add_executor_job(cur.is_file):
                     cur_sec = self._name_seconds(cur.name)
                     if (
-                        self._clip_rank(cur) == 2
+                        self._clip_rank(cur) >= 2
                         and cur_sec is not None
                         and abs(cur_sec - target) > CLIP_MATCH_WINDOW_S
                     ):
@@ -2099,7 +2106,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 delta = abs(sec - target)
                 rank = self._clip_rank(path)
                 # SD 回放段起点可能比开门记录早几秒；集成抓录仍是精确 HHMMSS
-                if rank == 2:
+                if rank >= 2:
                     if delta > CLIP_MATCH_WINDOW_S:
                         continue
                 elif delta != 0:
@@ -2183,7 +2190,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 if cur is not None and await self.hass.async_add_executor_job(cur.is_file):
                     cur_sec = self._name_seconds(cur.name)
                     if (
-                        self._clip_rank(cur) == 2
+                        self._clip_rank(cur) >= 2
                         and cur_sec is not None
                         and abs(cur_sec - target) > LOITER_MATCH_WINDOW_S
                     ):
@@ -2202,7 +2209,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                     continue
                 delta = abs(sec - target)
                 rank = self._clip_rank(path)
-                if rank == 2:
+                if rank >= 2:
                     if delta > LOITER_MATCH_WINDOW_S:
                         continue
                 elif delta != 0:

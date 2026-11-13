@@ -253,6 +253,39 @@ tail -f /config/logs/ezviz_sd_pull.log
 退出码：`0` 全成功 / `1` 有单段失败 / `2` 通道不可用整批中止 /
 `3` 已有实例在跑 / `4` 自检不过 / `5` 未到最小间隔被节流。
 
+### 6.5 云存储录像补录（`type=3`，开门瞬间 + 声音）
+
+如果设备开通了萤石**云存储**，可以额外启用一条更精确的补录链路。它和 SD 链路**完全独立**
+（不同脚本、不同日志、不同锁/节流状态），共用同一份 `clean_clips.json` 白名单：
+
+| 对比 | SD 回放 (`type=2`) | 云回放 (`type=3`) |
+|---|---|---|
+| 数据源 | 门锁本地 SD 卡，需设备在线配合 | 云端已存好的事件短片，不打扰设备 |
+| 时间点 | 段起点与开门差 1~12 秒，需 ±30 秒窗口校对 | 事件触发即生成，实测多数只差 0~2 秒 |
+| 音轨 | **无** | **AAC 16 kHz mono**（成品保留） |
+| 通道冷却 | 连续 12~14 段后必 404，需 15~20 分钟冷却 | 实测连续 4 段未见冷却（长期上限未验证） |
+| 产出 | `<HHMMSS>_sd.mp4` | `<HHMMSS>_cloud.mp4` |
+
+**配置**：把 [`examples/configuration.yaml`](examples/configuration.yaml) 里的
+`ezviz_cloud_pull` / `ezviz_cloud_pull_check` 两个子项合并进 `shell_command:`，检查配置并重启 HA。
+自动化可照 [`examples/automation_sd_pull.yaml`](examples/automation_sd_pull.yaml) 复制一份，
+把 `shell_command.ezviz_sd_pull` 换成 `shell_command.ezviz_cloud_pull`、事件延迟由 180 秒缩到 **90 秒**。
+
+**验收**：
+
+```bash
+sudo python3 /config/custom_components/ezviz_lock/tools/ezviz_cloud_pull.py --dry-run --hours 24
+tail -f /config/logs/ezviz_cloud_pull.log
+```
+
+成品是 `h264 High 1504x1968 @15fps + aac LC 16kHz mono`，逐帧绿占比 0% 才登记白名单。
+集成侧 `_clip_rank()` 把 `_cloud.mp4` 排在 `_sd.mp4` 之前：同一条开门记录先挂 SD 片，
+云片补进来后**自动升级**，没有云片的记录保持原样，绝不用别时段的片顶替。
+
+> **已知边界**：云回放流同样是 29.92fps 双路交织，A 路 0% 绿、B 路 92~100% 绿，
+> 本脚本只保留 A 路（门外主画面）。B 路成因未验证，详见项目知识库 §22.6。
+> 云存储索引接口对长跨度查询会截断，脚本已按 6 小时分片查询合并，不要改回单次大范围查询。
+
 ---
 
 ## 7. 服务一览
