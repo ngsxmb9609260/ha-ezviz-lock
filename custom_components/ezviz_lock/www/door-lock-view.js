@@ -197,7 +197,7 @@ class EzvizDoorLockPanel extends HTMLElement {
   }
 
   static getStubConfig() {
-    return { entity: "sensor.y3000fvx_plus_bw4390687_opens_today" };
+    return { entity: "sensor.y3000fvx_plus_yourserial_opens_today" };
   }
 
   setConfig(config) {
