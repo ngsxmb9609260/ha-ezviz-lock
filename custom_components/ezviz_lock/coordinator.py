@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -36,11 +37,33 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AlarmRecord, DoorRecord, EzvizApiClient, EzvizApiError
+from .app_msg import (
+    AppDataUnavailable,
+    AppMsgConfigError,
+    AppMsgError,
+    EzvizAppMsgClient,
+    load_app_config,
+)
+from .health import HealthMonitor, LockHealth, MemberInfo
 from .hevc_split import SplitError, green_frame_ratio, repair_interleaved_hevc
+from .peek_dual import DualPeekError, extract_dual_frames
 from .const import (
+    APP_MSG_CONFIG_FILE,
+    APP_MSG_LOITER_WINDOW_MS,
+    APP_MSG_OPEN_LOOKAHEAD_MS,
+    APP_MSG_OPEN_LOOKBACK_MS,
+    APP_MSG_SOURCE,
+    APP_MSG_SYNC_INTERVAL_S,
     ALARM_TYPE_LOITER,
+    ALARM_TYPE_OPEN,
+    OPEN_ALARM_TYPES,
+    OPEN_WAY_KEYS,
+    OPEN_WAY_TO_TYPE,
+    OTHER_ALARMS_KEEP_MAX,
+    USER_KEYS,
     CONF_ALARM_TYPE_NAMES,
     CONF_AUTO_DOWNLOAD_CLIP,
     CONF_CAPTURE_ON_EVENT,
@@ -58,6 +81,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SNAPSHOT_RETENTION,
     DOOR_CLOSE_TYPE,
+    DOOR_INSIDE_TYPE,
     DOORLOCK_SUBDIR,
     DOMAIN,
     EVENT_DOOR_OPENED,
@@ -77,6 +101,8 @@ from .const import (
     OPEN_TYPES,
     OPEN_TYPE_SLUGS,
     OUTSIDE_OPEN_TYPES,
+    PEEK_KEEP,
+    PEEK_SUBDIR,
     PLACEHOLDER_MAX_BYTES,
     PLACEHOLDER_MIN_WIDTH,
     CLIP_RETRY_DELAY_S,
@@ -91,9 +117,11 @@ _LOGGER = logging.getLogger(__name__)
 ALARM_LOOKBACK_MS = 15_000    # 开门时刻之前多久内的告警也算同一次通行
 ALARM_LOOKAHEAD_MS = 20_000   # 实测人脸告警与开门记录几乎同秒，窗口不能放大：
                               # 放到 45s 时，室内开门会抢走 20 秒后那次人脸开门的图
-CLIP_MATCH_WINDOW_S = 30      # SD 回放段与开门时刻的最大允许偏差（秒）。
-                              # 实测 6 次真实匹配的偏差是 1/2/2/3/5/12 秒；放宽到 90 秒会把
-                              # 「58 秒后另一件事的录像」贴给这次开门 —— 那是造假，宁可显示抓拍图
+CLIP_MATCH_WINDOW_S = 20      # SD 回放段与开门时刻的最大允许偏差（秒）。
+                              # 实测 6 次真实匹配的偏差是 1/2/2/3/5/12 秒；20 秒足够覆盖，
+                              # 且比旧的 30 秒更严。放宽到 90 秒会把「58 秒后另一件事的录像」
+                              # 贴给这次开门 —— 那是造假，宁可显示抓拍图。
+                              # 主人 11-18 08:57 要求由 30 收紧到 20。
 LOITER_MATCH_WINDOW_S = 45    # 徘徊唤醒的 SD 段窗口。徘徊录像本身是「触发前 5 秒 +
                               # 之后 25 秒」共 30 秒，段起点落在 [t-5, t+25] 都算这段；
                               # 取 45 秒覆盖并留切段偏移余量。同样不许越界贴片
@@ -129,6 +157,7 @@ class DoorEvent:
     is_close: bool = False           # openType=9 关门事件
     capture_ms: int | None = None    # 补拍发生的时刻（用于判断图片时效）
     user_name_raw: str | None = None  # 设备原始上报名（映射前），便于排查
+    source: str = "keylock"          # keylock=开门记录接口 / alarm=告警兜底
 
     @property
     def open_time_iso(self) -> str:
@@ -220,6 +249,50 @@ class LockData:
     loiter_events: list[LoiterEvent] = field(default_factory=list)     # 倒序
     loiter_today_count: int = 0
     loiter_last: LoiterEvent | None = None
+    # ---- 其它告警（只留痕：不进开门表/徘徊表、不配视频）----
+    other_alarms: list[dict[str, Any]] = field(default_factory=list)
+    # ---- 健康度（电量 / 信号 / 成员凭证，见 health.py）----
+    health: LockHealth = field(default_factory=LockHealth)
+
+
+def _decode_customer_info(raw: Any) -> dict[str, Any]:
+    """告警 customerInfo 解码：设备上报的是 base64(JSON)，也可能已是 dict/JSON 串。
+
+    Y3000FVX 的 17011 开门告警形如
+    base64('{"user":"用户2","IOT1SmartlockOpenDoorWay":"face"}')。
+    解析失败返回空 dict，调用方按"未知"处理，绝不因此中断同步。
+    """
+    if not raw:
+        return {}
+    data: Any = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            padded = text + "=" * (-len(text) % 4)
+            decoded = base64.b64decode(padded, validate=True).decode("utf-8", "replace")
+            data = json.loads(decoded)
+        except (ValueError, json.JSONDecodeError):
+            try:
+                data = json.loads(text)
+            except (ValueError, json.JSONDecodeError):
+                return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _open_way_to_type(info: dict[str, Any]) -> tuple[int, str]:
+    """从解码后的 customerInfo 取 (open_type, 原始开门方式字符串)。"""
+    way_raw = ""
+    for key in OPEN_WAY_KEYS:
+        val = info.get(key)
+        if val:
+            way_raw = str(val)
+            break
+    way = way_raw.strip().lower()
+    return OPEN_WAY_TO_TYPE.get(way, 4), way_raw  # 认不出默认按人脸(4)，门外开门
 
 
 def _deep_find(data: Any, keys: tuple[str, ...], depth: int = 0) -> Any:
@@ -286,6 +359,12 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         self._loiter_snap_tasks: set[str] = set()
         self._loiter_img_fail: set[str] = set()
         self._loiter_synced = False
+        # ---- 告警驱动 ----
+        # 已用告警兜底补过开门行的 alarmId，避免重复补；与 keylock 记录按时间窗去重
+        self._alarm_open_seen: set[str] = set()
+        # 非开门/徘徊告警：只留痕，不进开门表/徘徊表、不配视频
+        self._other_alarms: list[dict[str, Any]] = []
+        self._other_alarm_seen: set[str] = set()
         # 徘徊录像靠 ffmpeg 把推流转封装成 mp4；没有就退化成存 .flv
         self._ffmpeg = shutil.which("ffmpeg")
         if self._ffmpeg:
@@ -312,6 +391,39 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         )
         self._alarm_names = self._build_alarm_name_map(entry.options.get(CONF_ALARM_TYPE_NAMES, ""))
         self._user_aliases = self._build_user_alias_map(entry.options.get(CONF_USER_ALIASES, ""))
+
+        # 电量 / 信号 / 在线 / 成员凭证：独立监控器，失败不影响开门主链路
+        self.health = HealthMonitor(hass, client)
+        # 「门前看一眼」最近一次的实时抓拍（url + 本地路径 + 时刻）
+        self.peek: dict[str, Any] | None = None
+
+        # ---- App 通道（v1.7.0 消息 / v1.8.0 升为主数据源）----
+        # 无配置文件时完全不启用，行为与 1.6.0 一致；有文件时 openEvents /
+        # streaming/records / unifiedmsg 取代开放平台的高频轮询，失败自动回退。
+        self._app_msg_seen: set[str] = set()
+        self._app_msg_client: EzvizAppMsgClient | None = None
+        self._app_cfg_checked = False
+        self._app_msg_status: dict[str, Any] = {"enabled": False}
+        # v1.8.0 主数据源统计：开放平台到底省了多少次调用，全靠这几个计数器对外可见
+        self._api_call_stats: dict[str, int] = {
+            "open_door_app": 0,        # openEvents 成功次数（替代 keylock/open/list）
+            "open_door_fallback": 0,   # openEvents 失败回退开放平台次数
+            "loiter_fallback": 0,      # 徘徊告警回退开放平台次数
+            "alarm_fallback": 0,       # 告警兜底回退开放平台次数
+        }
+        # 健康度 device/info 降频到 10 分钟（原来每 20s 一次，独占 4320 次/天）
+        self._last_device_info_probe = 0.0
+        self._device_probe_interval_s = 600.0
+
+    @property
+    def app_msg_status(self) -> dict[str, Any]:
+        """App 通道健康快照（供传感器属性与巡检观察）。"""
+        return dict(self._app_msg_status)
+
+    @property
+    def api_call_stats(self) -> dict[str, int]:
+        """开放平台调用节省统计（只读快照）。"""
+        return dict(self._api_call_stats)
 
     # ------------------------------------------------------------------ 配置辅助
     def _build_user_alias_map(self, raw: str) -> dict[str, str]:
@@ -429,6 +541,14 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             self._loiter.append(lo)
             self._loiter_seen.add(lo.uid)
         self._loiter.sort(key=lambda x: x.time_ms, reverse=True)
+        # ---- 告警驱动：兜底开门 + 其它告警留痕 ----
+        self._alarm_open_seen = set(stored.get("alarm_open_seen") or [])
+        self._other_alarms = list(stored.get("other_alarms") or [])
+        self._other_alarm_seen = {
+            str(a.get("alarm_id")) for a in self._other_alarms if a.get("alarm_id")
+        }
+        # App 消息去重集也持久化：重启后不会把今日消息重新补一遍
+        self._app_msg_seen = set(stored.get("app_msg_seen") or [])
         # 把 config/www 下的旧图片搬到额外存储，然后回填 URL
         await self._async_migrate_legacy_snapshots()
         # 统一重签：持久化下来的可能是旧的 /local 地址或早先的签名
@@ -440,6 +560,11 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         # 徘徊的图片 / 录像也要重签，否则重启后全是 401
         await self._async_resign_loiter_urls()
         await self._async_prune_loiter()
+        # 健康度：恢复上次的成员名单基线，否则重启后第一次比对会把所有人报成「新增」
+        try:
+            await self.health.async_load()
+        except Exception:  # noqa: BLE001 - 基线读不出来最多是不报警，不影响主流程
+            _LOGGER.exception("读取门锁健康度基线失败")
         _LOGGER.debug(
             "恢复 %d 条历史事件、%d 条徘徊事件，去重索引 %d 条",
             len(self._events), len(self._loiter), len(self._seen),
@@ -470,10 +595,87 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                     }
                     for lo in self._loiter[:LOITER_KEEP_MAX]
                 ],
+                "alarm_open_seen": sorted(self._alarm_open_seen)[-1000:],
+                "other_alarms": self._other_alarms[:OTHER_ALARMS_KEEP_MAX],
+                "app_msg_seen": sorted(self._app_msg_seen)[-1000:],
             }
         )
 
     # ------------------------------------------------------------------ 主循环
+    async def _async_ensure_app_client(self) -> None:
+        """懒加载 App 通道客户端（配置文件只读一次）。
+
+        v1.8.0 起主循环开头就要用它取开门记录，所以从 _async_sync_app_messages
+        里抽出来共用。文件不存在 / enabled=false 时 _app_msg_client 保持 None，
+        集成行为与 1.6.0 完全一致（全部走开放平台）。
+        """
+        if self._app_cfg_checked:
+            return
+        self._app_cfg_checked = True
+        cfg: dict[str, Any] | None = None
+        try:
+            cfg = await self.hass.async_add_executor_job(load_app_config, self._config_root)
+        except AppMsgConfigError as err:
+            self._app_msg_status = {"enabled": False, "last_error": str(err)}
+            _LOGGER.warning("App 通道配置不可用：%s", err)
+        if cfg:
+            self._app_msg_client = EzvizAppMsgClient(
+                async_get_clientsession(self.hass),
+                str(cfg["account"]),
+                str(cfg["password_md5"]),
+                str(cfg["feature_code"]),
+                self.client.device_serial,
+            )
+            self._app_msg_status = {"enabled": True, "last_error": None}
+            _LOGGER.info(
+                "App 通道已启用（配置文件 %s，v1.8.0 作为主数据源）", APP_MSG_CONFIG_FILE
+            )
+        else:
+            self._app_msg_status = {"enabled": False}
+
+    async def _async_get_door_records(self, start_ms: int, end_ms: int) -> list[DoorRecord]:
+        """取开门记录（v1.8.0 降调用量核心）。
+
+        实测 2026-11-18 的关键发现（决定了这里的策略）：
+          - App unifiedmsg/list（云端消息表）**稳定**：keylock 断供期间仍有今天 3 条开门，
+            且 customerInfo 带 user + IOT1SmartlockOpenDoorWay，信息完整。
+          - App openEvents / 开放平台 keylock 都依赖**设备在线查询**：门锁休眠时 data=null。
+            实测 keylock 从 11-17 21:05 停更、openEvents 同期 0 条。
+
+        所以：
+          * 今天的开门实时性 → 交给 _async_sync_app_messages（每 30s 拉 unifiedmsg，
+            走 api.ys7.com 不占开放平台配额，v1.7.0 已实战验证能补开门行）。
+          * 这里只负责**冷启动重建历史 + 关门事件(9)**，用开放平台 keylock：
+            - 冷启动必拉一次（全量历史）
+            - App 通道启用后降频到 10 分钟一次（原来每 20s = 4320 次/天 → 144 次/天）
+          * App 未配置时回到原来的每轮都拉（行为与 1.6.0 一致）。
+        """
+        now_mono = time.monotonic()
+        app_on = self._app_msg_client is not None
+        cold = not getattr(self, "_door_records_synced", False)
+        if app_on and not cold:
+            elapsed = now_mono - getattr(self, "_last_door_records_sync", 0.0)
+            if elapsed < self._device_probe_interval_s:
+                # 本轮不拉 keylock，返回空；已有事件池不受影响，
+                # 今天的开门由 _async_sync_app_messages 持续补入。
+                self._app_msg_status["source"] = "app(unifiedmsg)"
+                return []
+
+        self._last_door_records_sync = now_mono
+        self._door_records_synced = True
+        try:
+            records = await self.client.async_get_door_records_range(
+                start_ms, end_ms, max_pages=6
+            )
+            if app_on:
+                self._api_call_stats["open_door_fallback"] += 1
+            self._app_msg_status["source"] = "keylock" if records else "keylock(empty)"
+            return records
+        except EzvizApiError as err:
+            # keylock 断供/异常时不能让整个集成 unavailable —— unifiedmsg 会兜住今天的开门
+            _LOGGER.debug("keylock/open/list 拉取失败（今天的开门由 App 消息通道兜底）：%s", err)
+            return []
+
     async def _async_update_data(self) -> LockData:
         _t0 = time.perf_counter()
         _ph = {}
@@ -487,7 +689,15 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         except Exception as err:  # noqa: BLE001 - 索引异常不能拖垮整个集成
             _LOGGER.debug("加载干净录像索引失败：%s", err)
 
+        # v1.8.0：主循环开头就要用 App 客户端取开门记录，先确保它已初始化
         try:
+            await self._async_ensure_app_client()
+        except Exception as err:  # noqa: BLE001 - 初始化失败不能拖垮集成
+            _LOGGER.debug("App 通道初始化失败：%s", err)
+
+        try:
+            # 设备名只需取一次；设备信息探测（在线/WiFi/信号）本身由 health 负责，
+            # 那里已降到 10 分钟一次。这里只在首次补个名字。
             if self._device_name is None:
                 try:
                     info = await self.client.async_get_device_info()
@@ -501,10 +711,10 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             today_start = dt_util.start_of_local_day()
             today_start_ms = int(today_start.timestamp() * 1000)
             now_ms = int(dt_util.now().timestamp() * 1000)
-            records = await self.client.async_get_door_records_range(
+            # v1.8.0：App openEvents 优先，失败回退开放平台 keylock/open/list
+            records = await self._async_get_door_records(
                 today_start_ms - 6 * 3_600_000,
                 now_ms + 60_000,
-                max_pages=6,
             )
             _mark("开门记录")
         except EzvizApiError as err:
@@ -606,7 +816,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 # 事件即时抓录已停用：取流太慢，抓到的画面比开门晚 20~30 秒，
                 # 与告警抓拍对不上（主人 11-12 19:26 反馈「录像都是错的」）。
                 # 开门录像统一由 _async_backfill_clips 从 SD 回放白名单按开门
-                # 时刻 ±90s 认领；本轮新事件在下方节流回填里自动挂上。
+                # 时刻 ±CLIP_MATCH_WINDOW_S（20 秒）认领；本轮新事件在下方节流回填里自动挂上。
                 if not ev.is_close and ENABLE_LIVE_CAPTURE:
                     self.hass.async_create_task(self._async_record_door_live(ev))
                 if ev.is_close:
@@ -624,6 +834,26 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         # 目录遍历走线程池，避免在事件循环里做阻塞 IO
         await self.hass.async_add_executor_job(self._cleanup_snapshots)
         _mark("清理")
+
+        # 告警驱动的开门兜底：keylock/open/list 停更时，用 alarm/list 的开门告警
+        # 补开门行（含人员/方式/视频）；其它类型告警只留痕。失败不影响开门主流程。
+        try:
+            await self._async_sync_alarm_opens(today_start_ms, now_ms)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 兜底出问题不能让集成不可用
+            _LOGGER.exception("告警兜底开门同步失败")
+        _mark("告警兜底")
+
+        # App 账号统一消息：第三条独立认证通道。可选增强——没有配置文件时
+        # 下面这个方法直接返回，集成行为与 1.6.0 一字不差。
+        try:
+            await self._async_sync_app_messages(today_start_ms, now_ms)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 第三通道必须完全隔离
+            _LOGGER.exception("App 消息通道同步失败")
+        _mark("App消息")
 
         # 徘徊唤醒：与开门记录是两条独立数据源，单独同步（失败不影响开门主流程）
         try:
@@ -647,6 +877,16 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             except Exception:  # noqa: BLE001 - 回填失败不能让实体变不可用
                 _LOGGER.exception("认领 SD 开门录像失败")
         _mark("录像认领")
+
+        # 健康度（电量 / WiFi 信号 / 在线 / 成员凭证）：内部自带节流与异常隔离，
+        # 任何失败都只落到 health.last_error，绝不让整台锁变 unavailable。
+        try:
+            await self.health.async_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("门锁健康度探测失败")
+        _mark("健康度")
 
         today = dt_util.now().date()
 
@@ -684,10 +924,13 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             today_events=today_opens,
             last_close=closes[0] if closes else None,
             total_count=len(self._events),
+            online=self.health.data.online,
             device_name=self._device_name,
             loiter_events=self._loiter[:LOITER_KEEP_MAX],
             loiter_today_count=len(today_loiter),
             loiter_last=self._loiter[0] if self._loiter else None,
+            other_alarms=self._other_alarms,
+            health=self.health.data,
         )
 
     async def _async_capture_for_new(self, events: list[DoorEvent]) -> None:
@@ -714,6 +957,351 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             return
         await self._async_archive_capture(target, url)
 
+    # ------------------------------------------------------------------ 告警兜底
+    async def _async_sync_alarm_opens(self, today_start_ms: int, now_ms: int) -> None:
+        """告警驱动的开门兜底 + 其它告警留痕。
+
+        背景：keylock/open/list 会周期性停更（实测 11-16 中午、11-17 21:05），
+        但同一时刻 alarm/list 的 17011 开门告警仍在上报。本方法把开门类告警
+        (OPEN_ALARM_TYPES) 转成开门事件补进开门表，使页面继续更新并认领 SD 录像；
+        customerInfo 里带 user + 开门方式，正好补上告警"没人名/方式"的短板。
+
+        分流规则（主人 11-18 08:40 明确要求）：
+          - 开门类(17011/10013) → 进开门表 + 匹配视频
+          - 徘徊(15504)         → 交给 _async_sync_loiter（本方法跳过，不重复建）
+          - 其它告警类型        → 只存 self._other_alarms 留痕，不进表、不配视频
+
+        去重：alarm_id 记忆 + 与 keylock 事件按 ALARM_LOOKBACK/AHEAD 时间窗比对，
+        避免同一开门在 keylock 与 alarm 两条链路各生成一行。绝不下载媒体（轮询内）。
+
+        节流：alarm/list 每 60 秒拉一次即可（告警上报本身有几秒延迟）；首轮必跑。
+        """
+        now_mono = time.monotonic()
+        # v1.8.0：App 通道启用时，unifiedmsg 已完整覆盖开门兜底+其它告警留痕，
+        # 开放平台 alarm/list 只作回退，降频到 10 分钟一次（省约 1400 次/天）。
+        # App 未启用时维持原来的 60 秒。
+        interval = 600 if self._app_msg_client is not None else 60
+        if (
+            getattr(self, "_alarm_opens_synced", False)
+            and now_mono - getattr(self, "_last_alarm_opens_sync", 0.0) < interval
+        ):
+            return
+        self._last_alarm_opens_sync = now_mono
+        self._alarm_opens_synced = True
+        try:
+            alarms = await self.client.async_get_alarms(
+                today_start_ms - ALARM_LOOKBACK_MS, now_ms + 60_000,
+                channel_no=self._channel_no, page_size=50,
+            )
+            if self._app_msg_client is not None:
+                self._api_call_stats["alarm_fallback"] += 1
+        except EzvizApiError as err:
+            _LOGGER.debug("拉取告警（开门兜底）失败：%s", err)
+            return
+
+        added: list[DoorEvent] = []
+        other_new: list[dict[str, Any]] = []
+
+        for alarm in alarms:
+            atype = alarm.alarm_type
+            aid = str(alarm.alarm_id or "") or f"{alarm.alarm_time}|{atype}"
+
+            # ---- 徘徊单列：交给专门的同步方法，这里跳过 ----
+            if atype == ALARM_TYPE_LOITER:
+                continue
+
+            # ---- 开门类：转 DoorEvent 补开门行 ----
+            if atype in OPEN_ALARM_TYPES:
+                if aid in self._alarm_open_seen:
+                    continue
+                # 与 keylock 已登记的开门按时间窗去重（同一时刻不补第二行）
+                lo = alarm.alarm_time - ALARM_LOOKBACK_MS
+                hi = alarm.alarm_time + ALARM_LOOKAHEAD_MS
+                if any(
+                    not ev.is_close and lo <= ev.open_time_ms <= hi
+                    for ev in self._events
+                ):
+                    self._alarm_open_seen.add(aid)
+                    continue
+
+                info = _decode_customer_info(alarm.customer_info)
+                otype, way_raw = _open_way_to_type(info)
+                raw_name = ""
+                for key in USER_KEYS:
+                    if info.get(key):
+                        raw_name = str(info[key]).strip()
+                        break
+                user_name = self.display_user_name(raw_name) if raw_name else "未知用户"
+
+                record = DoorRecord(
+                    user_name=user_name,
+                    open_type=otype,
+                    open_time=alarm.alarm_time,
+                )
+                try:
+                    ev = await self._build_one(
+                        record, download_media=False, alarms_all=[alarm]
+                    )
+                except Exception:  # noqa: BLE001 - 单条失败不能拖垮兜底
+                    _LOGGER.exception("告警兜底构建开门事件失败：%s", aid)
+                    continue
+                # 打上来源标记，页面/排查都能区分是 keylock 还是告警补的
+                ev.source = "alarm"
+                ev.alarm_id = ev.alarm_id or aid
+                ev.alarm_type = ev.alarm_type or atype
+                ev.alarm_type_name = ev.alarm_type_name or self.alarm_type_name(atype)
+                added.append(ev)
+                self._alarm_open_seen.add(aid)
+                continue
+
+            # ---- 其它告警：只留痕，不进开门表/徘徊表、不配视频 ----
+            if aid in self._other_alarm_seen:
+                continue
+            when = dt_util.as_local(
+                datetime.fromtimestamp(alarm.alarm_time / 1000, tz=dt_util.UTC)
+            ).isoformat()
+            self._other_alarm_seen.add(aid)
+            other_new.append({
+                "alarm_id": aid,
+                "alarm_type": atype,
+                "alarm_type_name": self.alarm_type_name(atype) or alarm.alarm_name or "未知告警",
+                "time": when,
+                "time_ms": alarm.alarm_time,
+                "has_pic": bool(alarm.pic_url),
+                "rec_state": alarm.rec_state,
+            })
+
+        # 开门兜底事件并入事件池（新→旧），并触发实体刷新
+        if added:
+            known = {e.uid for e in self._events}
+            for ev in sorted(added, key=lambda e: e.open_time_ms, reverse=True):
+                if ev.uid in known:
+                    continue
+                self._events.append(ev)
+                known.add(ev.uid)
+                self._seen.add(ev.uid)
+                self.hass.bus.async_fire(EVENT_DOOR_OPENED, ev.to_dict())
+                _LOGGER.info(
+                    "告警兜底补开门行：%s / %s / %s（来源 alarm %s）",
+                    ev.open_time_iso, ev.user_name, ev.open_type_name, ev.alarm_id,
+                )
+            self._events.sort(key=lambda e: e.open_time_ms, reverse=True)
+            self._events = self._events[:MAX_KEEP_EVENTS]
+            # 让新补的开门行尽快认领 SD 录像（不等 120s 节流）
+            try:
+                await self._async_backfill_clips(self._events)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("告警兜底后认领录像失败（下轮重试）")
+
+        if other_new:
+            self._other_alarms = (other_new + self._other_alarms)[:OTHER_ALARMS_KEEP_MAX]
+            _LOGGER.debug("其它告警留痕 %d 条（不配视频）", len(other_new))
+
+        if added or other_new:
+            await self._async_save_state()
+
+    # ------------------------------------------------------- App 消息第三通道
+    async def _async_sync_app_messages(self, today_start_ms: int, now_ms: int) -> None:
+        """从 App 账号「统一消息列表」补开门 / 徘徊行，其它类型只留痕。
+
+        定位（2026-11-18 实测）：第三条独立认证通道。端点
+        ``api.ys7.com/v3/unifiedmsg/list?stype=9904,2701`` 与开放平台
+        ``open.ys7.com/api/lapp/alarm/list`` 数据表现同源但凭据体系独立。
+        只有当 keylock/open/list 与 alarm/list 两条链路都没登记该事件时才补一行，
+        平时完全不干扰现有逻辑。
+
+        去重三层：
+          1. msgId 记忆（天然主键，且已持久化，重启不重复）
+          2. 与 self._events 已有开门按 ±20 秒窗比对
+          3. DoorEvent.uid 由 _build_one 依据时刻/方式/人员生成，入池前再查一次
+        分流与告警兜底一致：开门类(17011/10013)进开门表、15504 进徘徊表、
+        其余（含门铃呼叫 20002）只存 other_alarms，不配视频。
+        室内开门(5) 不配图/视频：_build_one 的 OUTSIDE_OPEN_TYPES 已保证。
+        本方法不下载任何媒体，回填只走本地存档与 SD 白名单。
+        """
+        now_mono = time.monotonic()
+        if (
+            getattr(self, "_app_msg_synced", False)
+            and now_mono - getattr(self, "_last_app_msg_sync", 0.0) < APP_MSG_SYNC_INTERVAL_S
+        ):
+            return
+        self._last_app_msg_sync = now_mono
+        self._app_msg_synced = True
+
+        # 客户端已在主循环开头由 _async_ensure_app_client 初始化
+        if self._app_msg_client is None:
+            return
+
+        day = dt_util.now().strftime("%Y%m%d")
+        try:
+            messages = await self._app_msg_client.async_get_messages(day)
+        except AppMsgError as err:
+            self._app_msg_status["last_error"] = str(err)
+            _LOGGER.debug("拉取 App 统一消息失败：%s", err)
+            return
+
+        self._app_msg_status["last_error"] = None
+        self._app_msg_status["last_sync"] = dt_util.now().isoformat()
+        self._app_msg_status["messages_today"] = len(messages)
+
+        added_opens: list[DoorEvent] = []
+        added_loiter: list[LoiterEvent] = []
+        other_new: list[dict[str, Any]] = []
+        existing_other_ids = {
+            str(a.get("alarm_id")) for a in self._other_alarms if a.get("alarm_id")
+        }
+
+        for msg in messages:
+            if msg.msg_id in self._app_msg_seen:
+                continue
+            self._app_msg_seen.add(msg.msg_id)
+            atype = msg.alarm_type
+            t = msg.event_time_ms
+            if t <= 0 or t < today_start_ms - 60_000:
+                continue
+
+            # ---- 开门类：两条现有链路都没登记才补 ----
+            if atype in OPEN_ALARM_TYPES:
+                lo = t - APP_MSG_OPEN_LOOKBACK_MS
+                hi = t + APP_MSG_OPEN_LOOKAHEAD_MS
+                if any(
+                    not ev.is_close and lo <= ev.open_time_ms <= hi
+                    for ev in self._events
+                ):
+                    continue
+                info = _decode_customer_info(msg.customer_info)
+                otype, _way = _open_way_to_type(info)
+                raw_name = ""
+                for key in USER_KEYS:
+                    if info.get(key):
+                        raw_name = str(info[key]).strip()
+                        break
+                record = DoorRecord(
+                    user_name=raw_name or "未知用户",
+                    open_type=otype,
+                    open_time=t,
+                )
+                # 构造一条等价告警，复用 _build_one 的人数估算与图片配对逻辑
+                alarm = AlarmRecord(
+                    alarm_id=msg.msg_id,
+                    alarm_type=atype,
+                    alarm_time=t,
+                    pic_url=msg.pic_url,
+                    channel_no=msg.channel,
+                    rec_state=msg.rec_state,
+                    pre_time=msg.pre_time,
+                    delay_time=msg.delay_time,
+                    customer_info=msg.customer_info,
+                )
+                try:
+                    ev = await self._build_one(
+                        record, download_media=False, alarms_all=[alarm]
+                    )
+                except Exception:  # noqa: BLE001 - 单条失败不拖垮整批
+                    _LOGGER.exception("App 消息补开门行失败：%s", msg.msg_id)
+                    continue
+                ev.source = APP_MSG_SOURCE
+                ev.alarm_id = ev.alarm_id or msg.msg_id
+                ev.alarm_type = ev.alarm_type or atype
+                ev.alarm_type_name = ev.alarm_type_name or self.alarm_type_name(atype)
+                added_opens.append(ev)
+                continue
+
+            # ---- 徘徊：与已有徘徊行按时间窗去重；不主动触发录像下载 ----
+            if atype == ALARM_TYPE_LOITER:
+                if any(
+                    abs(item.time_ms - t) <= APP_MSG_LOITER_WINDOW_MS
+                    for item in self._loiter
+                ):
+                    continue
+                uid = f"appmsg:{msg.msg_id}"
+                if uid in self._loiter_seen:
+                    continue
+                lo_ev = LoiterEvent(
+                    uid=uid,
+                    alarm_type=atype,
+                    alarm_type_name=self.alarm_type_name(atype) or "徘徊检测",
+                    time_ms=t,
+                    alarm_id=msg.msg_id,
+                    pre_s=msg.pre_time or LOITER_DEFAULT_PRE_S,
+                    post_s=msg.delay_time or LOITER_DEFAULT_POST_S,
+                )
+                self._loiter.append(lo_ev)
+                self._loiter_seen.add(uid)
+                added_loiter.append(lo_ev)
+                # v1.8.0：App 通道成为主数据源后，徘徊抓拍图也走 App 的 pic 字段，
+                # 否则关掉开放平台 alarm/list 轮询后徘徊记录会没有图。
+                if (
+                    msg.pic_url
+                    and not lo_ev.snapshot_path
+                    and uid not in self._loiter_snap_tasks
+                    and uid not in self._loiter_img_fail
+                ):
+                    self._loiter_snap_tasks.add(uid)
+                    self.hass.async_create_task(
+                        self._async_bg_loiter_snapshot(lo_ev, msg.pic_url)
+                    )
+                continue
+
+            # ---- 其它（含门铃呼叫 20002）：只留痕，不进表、不配视频 ----
+            if msg.msg_id in existing_other_ids:
+                continue
+            existing_other_ids.add(msg.msg_id)
+            when = dt_util.as_local(
+                datetime.fromtimestamp(t / 1000, tz=dt_util.UTC)
+            ).isoformat()
+            other_new.append({
+                "alarm_id": msg.msg_id,
+                "alarm_type": atype,
+                "alarm_type_name": self.alarm_type_name(atype) or "未知告警",
+                "time": when,
+                "time_ms": t,
+                "has_pic": bool(msg.pic_url),
+                "rec_state": msg.rec_state,
+                "title": msg.title,
+                "source": APP_MSG_SOURCE,
+            })
+
+        if added_opens:
+            known = {e.uid for e in self._events}
+            for ev in sorted(added_opens, key=lambda e: e.open_time_ms, reverse=True):
+                if ev.uid in known:
+                    continue
+                self._events.append(ev)
+                known.add(ev.uid)
+                self._seen.add(ev.uid)
+                self.hass.bus.async_fire(EVENT_DOOR_OPENED, ev.to_dict())
+                _LOGGER.info(
+                    "App 消息补开门行：%s / %s / %s（msgId %s）",
+                    ev.open_time_iso, ev.user_name, ev.open_type_name, ev.alarm_id,
+                )
+            self._events.sort(key=lambda e: e.open_time_ms, reverse=True)
+            self._events = self._events[:MAX_KEEP_EVENTS]
+
+        if added_loiter:
+            self._loiter.sort(key=lambda x: x.time_ms, reverse=True)
+            for lo_ev in added_loiter:
+                self.hass.bus.async_fire(EVENT_LOITER_DETECTED, lo_ev.to_dict())
+            _LOGGER.info("App 消息补徘徊行 %d 条", len(added_loiter))
+
+        if other_new:
+            self._other_alarms = (other_new + self._other_alarms)[:OTHER_ALARMS_KEEP_MAX]
+            _LOGGER.debug("App 消息其它告警留痕 %d 条（不配视频）", len(other_new))
+
+        self._app_msg_status["added_opens"] = len(added_opens)
+        self._app_msg_status["added_loiter"] = len(added_loiter)
+        self._app_msg_status["other_logged"] = len(other_new)
+
+        if added_opens or added_loiter or other_new:
+            # 回填只走本地存档与 SD 白名单，不再额外请求云端
+            try:
+                await self._async_backfill_snapshots(self._events)
+                await self._async_backfill_clips(self._events)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("App 消息补录后回填失败（下轮重试）")
+            await self._async_save_state()
+            self.async_update_listeners()
+
     # ------------------------------------------------------------------ 徘徊唤醒
     async def _async_sync_loiter(self, today_start_ms: int, now_ms: int) -> None:
         """同步「徘徊唤醒」：拉告警 → 建事件 → 把图与录像丢给后台任务。
@@ -724,12 +1312,26 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         **这里绝不做任何下载**：本方法在轮询里被 await，一旦下载就会拖住
         首次刷新（曾经把启动拖到 90 秒超时、所有实体变 unavailable）。
         """
+        # v1.8.0：App 通道启用时，unifiedmsg 的 15504 分支已完整覆盖徘徊建行+抓拍图，
+        # 开放平台 alarm/list 只作回退，降频到 10 分钟一次（原来每 20s，省约 4200 次/天）。
+        now_mono = time.monotonic()
+        interval = 600 if self._app_msg_client is not None else 0
+        if (
+            interval
+            and getattr(self, "_loiter_synced", False)
+            and now_mono - getattr(self, "_last_loiter_sync", 0.0) < interval
+        ):
+            return
+        self._last_loiter_sync = now_mono
+
         # 首轮拉今天的全量做重建；之后只回看最近 15 分钟（覆盖几轮轮询的遗漏）
         lo_ms = today_start_ms if not self._loiter_synced else max(today_start_ms, now_ms - 900_000)
         try:
             alarms = await self.client.async_get_alarms(
                 lo_ms, now_ms + 60_000, channel_no=self._channel_no
             )
+            if self._app_msg_client is not None:
+                self._api_call_stats["loiter_fallback"] += 1
         except EzvizApiError as err:
             _LOGGER.debug("拉取徘徊告警失败：%s", err)
             return
@@ -1999,7 +2601,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         `clip_url` 是运行时算出来的签名地址，不落盘；重启后不认回来，
         界面会显示「无录像」。独立拉取器产出的 `_sd.mp4` 是拆流修复过的
         干净 H.264，优先级高于旧集成「事件时抓直播」的绿屏 mp4：只要
-        同一时刻附近（±90 秒）找到它，就把事件指过去。
+        同一时刻附近（±CLIP_MATCH_WINDOW_S = 20 秒）找到它，就把事件指过去。
 
         返回本次变更条数（清掉的错片 + 认领的干净片），供调用方决定是否落盘。
         """
@@ -2012,8 +2614,20 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         # 先收拾状态和磁盘对不上的：文件被删了（比如当时的录像是占位图），
         # 事件上却还挂着 ready + 一个打不开的地址；顺带清掉非白名单的旧录像。
         dropped = 0
+        inside_cleared = 0
         for ev in events:
-            if ev.is_close or not ev.clip_url:
+            if not ev.clip_url:
+                continue
+            # 室内开门（type5）物理上没有门外画面：主动清掉历史错挂的视频，
+            # 且不参与本轮认领（主人 11-18 08:58 要求）。
+            if ev.open_type == DOOR_INSIDE_TYPE:
+                ev.clip_url = None
+                ev.clip_path = None
+                ev.clip_bytes = 0
+                ev.clip_status = "no_stream"
+                inside_cleared += 1
+                continue
+            if ev.is_close:
                 continue
             local = Path(ev.clip_path) if ev.clip_path else self._url_to_abs(ev.clip_url)
             rel = None
@@ -2035,8 +2649,14 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             dropped += 1
         if dropped:
             _LOGGER.info("清理了 %d 条录像不存在或未经逐帧验收的记录", dropped)
+        if inside_cleared:
+            _LOGGER.info("清掉了 %d 条室内开门事件上错挂的录像（室内开门不配视频）", inside_cleared)
 
-        need = [ev for ev in events if not ev.is_close]
+        # 室内开门（type5）不参与视频认领：没有门外画面，配了就是造假。
+        need = [
+            ev for ev in events
+            if not ev.is_close and ev.open_type != DOOR_INSIDE_TYPE
+        ]
         # 只有徘徊、没有开门时也要继续往下走（以前这里会直接返回，徘徊永远挂不上）
         if not need and not self._loiter:
             return dropped
@@ -2362,3 +2982,139 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         except EzvizApiError as err:
             _LOGGER.warning("获取回放地址失败：%s", err)
             return None
+
+    async def async_peek(self, *, keep: int = PEEK_KEEP) -> dict[str, Any]:
+        """「门前看一眼」：一次抓出上摄 / 下摄两路画面并落盘。
+
+        平台 ``device/capture`` 只给上摄（1504×1968），``channelNo=2`` 报
+        「通道不存在」——没有拍下摄的独立接口。下摄只能从实时流里按 VCL NAL
+        奇偶拆出来（见 peek_dual.py），两帧来自同一段码流、水印时刻一致。
+
+        流程：
+          ① device/capture 抓上摄 —— 快（2~3 s），兼作唤醒设备与兜底；
+          ② 取一小段实时流拆出同刻上下两摄 —— 慢，失败不阻断；
+          ③ ②成功用双路同刻图；②失败退回 ① 的单路上摄并标注。
+        """
+        started = time.monotonic()
+        now = dt_util.now()
+        stamp = now.strftime("%Y%m%d_%H%M%S")
+        folder = self._snapshot_root / PEEK_SUBDIR
+        up_path = folder / f"peek_{stamp}_up.jpg"
+        down_path = folder / f"peek_{stamp}_down.jpg"
+
+        # ① 快通道：唤醒设备 + 兜底单路图
+        remote: str | None = None
+        capture_err: str | None = None
+        try:
+            remote = await self.client.async_capture(channel_no=self._channel_no)
+        except EzvizApiError as err:
+            capture_err = str(err)
+
+        # ② 双路：一次取流，拆出同刻上下两摄
+        dual_stat: dict | None = None
+        dual_err: str | None = None
+        if self._ffmpeg:
+            try:
+                live = await asyncio.wait_for(
+                    self.client.async_get_live_url(
+                        channel_no=self._channel_no, expire_seconds=600
+                    ),
+                    timeout=20,
+                )
+                if not live:
+                    raise DualPeekError("取直播地址失败")
+                dual_stat = await asyncio.wait_for(
+                    self.hass.async_add_executor_job(
+                        extract_dual_frames, self._ffmpeg, live, up_path, down_path
+                    ),
+                    timeout=50,
+                )
+            except (asyncio.TimeoutError, DualPeekError, EzvizApiError, OSError) as err:
+                dual_err = str(err) or type(err).__name__
+        else:
+            dual_err = "系统里没有 ffmpeg"
+
+        if dual_err:
+            _LOGGER.info("门前看一眼：双路取流未成功（%s），降级单路上摄", dual_err)
+            # 万一超时前只写出了一张，清掉半成品再走单路
+            for path in (up_path, down_path):
+                if path.exists():
+                    await self._async_remove_file(str(path))
+            if not remote:
+                return {
+                    "url": None, "path": None, "time": None,
+                    "error": (
+                        f"抓拍失败：{capture_err or '设备未响应'}；"
+                        f"双路取流也失败：{dual_err}"
+                    ),
+                }
+            try:
+                await self.client.async_download(
+                    remote, up_path, max_bytes=20 * 1024 * 1024
+                )
+            except (EzvizApiError, OSError) as err:
+                return {"url": None, "path": None, "time": None, "error": f"图片下载失败：{err}"}
+            mode = "single"
+            note = f"仅上摄（下摄取流失败：{dual_err}）"
+        else:
+            mode = "dual"
+            note = (
+                f"双摄同刻：上摄 {dual_stat['up'][0]}×{dual_stat['up'][1]} / "
+                f"下摄 {dual_stat['down'][0]}×{dual_stat['down'][1]}"
+                if dual_stat
+                else "双摄"
+            )
+            _LOGGER.info("门前看一眼：双路拆流成功（%s）", note)
+
+        up_url = self._abs_to_url(up_path)
+        lower = None
+        if mode == "dual" and down_path.is_file():
+            lower = {"url": self._abs_to_url(down_path), "path": str(down_path)}
+        self.peek = {
+            "url": up_url,                 # 兼容旧前端 / 图片实体：主图 = 上摄
+            "path": str(up_path),
+            "time": now.isoformat(timespec="seconds"),
+            "mode": mode,
+            "upper": {"url": up_url, "path": str(up_path)},
+            "lower": lower,
+            "note": note,
+            "source": "live_split" if mode == "dual" else "device_capture",
+        }
+        # 一次双路会写两张，按「组」保留最近 keep 次抓拍
+        await self.hass.async_add_executor_job(self._prune_peek, keep)
+        self.async_update_listeners()
+        _LOGGER.info(
+            "门前看一眼：%s（耗时 %.1fs）", mode, time.monotonic() - started
+        )
+        return {**self.peek, "error": None}
+
+    def _prune_peek(self, keep: int) -> None:
+        """按「一次抓拍」分组清理，不能按张数截。
+
+        文件名形如 ``peek_<ts>_up.jpg`` / ``peek_<ts>_down.jpg``；旧版
+        ``peek_<ts>.jpg`` 无后缀，单独成组，一并纳入清理。
+        """
+        folder = self._snapshot_root / PEEK_SUBDIR
+        try:
+            files = [p for p in folder.iterdir() if p.is_file()]
+        except OSError:
+            return
+        groups: dict[str, list[Path]] = {}
+        for p in files:
+            name = p.stem
+            for suffix in ("_up", "_down"):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)]
+                    break
+            groups.setdefault(name, []).append(p)
+        ordered = sorted(
+            groups.items(),
+            key=lambda kv: max((p.stat().st_mtime for p in kv[1]), default=0),
+            reverse=True,
+        )
+        for _name, paths in ordered[keep:]:
+            for old in paths:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass

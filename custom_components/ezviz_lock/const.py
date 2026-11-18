@@ -11,7 +11,7 @@ from __future__ import annotations
 
 DOMAIN = "ezviz_lock"
 NAME = "EZVIZ Lock"
-VERSION = "1.0.0"
+VERSION = "1.8.0"
 
 # ---- 配置键 ----
 CONF_APP_KEY = "app_key"
@@ -65,6 +65,9 @@ OPEN_TYPES: dict[int, str] = {
 # 关门事件：不产生人员/人数/抓拍图，不计入开门次数
 DOOR_CLOSE_TYPE = 9
 
+# 室内开门：物理上没有门外画面，不配视频、不补抓拍图（主人 11-18 08:58 要求）
+DOOR_INSIDE_TYPE = 5
+
 # 是否属于"从门外进入"的开锁方式（室内开门/机械钥匙不产生门外抓拍，单独处理）
 OUTSIDE_OPEN_TYPES = {0, 1, 2, 3, 4, 6, 7}
 
@@ -104,6 +107,25 @@ DEFAULT_ALARM_TYPE_NAMES: dict[int, str] = {
     10025: "包裹看护",
     10026: "儿童出门检测",
 }
+
+# ---- 告警驱动的开门记录兜底 ----
+# 这台锁 keylock/open/list 会周期性停更（实测 11-16 中午、11-17 21:05 各一次，
+# 重启设备只能顶几个钟头）。同一时刻 alarm/list 的 17011 仍在正常上报，且
+# customerInfo 里带 user + IOT1SmartlockOpenDoorWay，可用它补开门行并配录像。
+# 只有下列类型被视为「开门」；其它告警类型只进 other_alarms 留痕，不进开门表、不配视频。
+ALARM_TYPE_OPEN = 17011                       # 开门（人脸/室内等，客户信息里带开门方式）
+OPEN_ALARM_TYPES: frozenset[int] = frozenset({ALARM_TYPE_OPEN, 10013})  # 10013=开门(通用)
+# 17011 的 customerInfo 是 base64 JSON：{"user":"用户2","IOT1SmartlockOpenDoorWay":"face"}
+OPEN_WAY_KEYS = ("IOT1SmartlockOpenDoorWay", "openDoorWay", "openWay")
+USER_KEYS = ("user", "userName", "lockUserName")
+# 英文开门方式 → OPEN_TYPES 里的取值（用于复用显示名与 OUTSIDE_OPEN_TYPES 判断）
+OPEN_WAY_TO_TYPE: dict[str, int] = {
+    "fingerprint": 0, "password": 1, "card": 2, "temp_password": 3,
+    "face": 4, "inside": 5, "remote": 6, "palm_vein": 7,
+    "mechanical_key": 8, "key": 8,
+}
+# 其它告警最多留多少条（只留痕，不配视频）
+OTHER_ALARMS_KEEP_MAX = 200
 
 # ---- 徘徊检测（录像）----
 # 这台锁「徘徊唤醒」实测上报 alarmType=15504，并带 recState=4（SD 卡录像）。
@@ -175,6 +197,36 @@ LOCAL_CLIP_PREFIX = f"/local/{CLIP_SUBDIR}"
 
 # ---- 事件总线 ----
 EVENT_DOOR_OPENED = f"{DOMAIN}_door_opened"
+# 成员名单 / 凭证数量发生变化（新增、删除、人脸/掌静脉/密码/门卡增减）
+EVENT_MEMBERS_CHANGED = f"{DOMAIN}_members_changed"
+
+# ---- 健康度监控 ----
+# 电量与充电状态变化很慢，10 分钟一次足够；成员名单更慢，30 分钟一次。
+# 两者都靠 time.monotonic() 节流，与 scan_interval（默认 20 秒）解耦。
+BATTERY_POLL_INTERVAL_S = 600
+MEMBERS_POLL_INTERVAL_S = 1800
+# v1.8.0：device/info（在线/WiFi信号/本地IP）原来是每轮 20s 一次、独占 4320 次/天，
+# 是开放平台调用大头。电池门锁状态变化慢，降到 10 分钟一次足够，省约 4260 次/天。
+DEVICE_POLL_INTERVAL_S = 600
+# /api/v3/keyValue 返回的 multiPower 里 Status 的取值
+POWER_STATUS_NAMES: dict[str, str] = {
+    "0": "未充电",
+    "1": "充电中",
+    "2": "已充满",
+    "3": "无电池",
+    "4": "电池异常",
+}
+# 成员凭证数量字段 → 中文标签（顺序即展示顺序）
+CREDENTIAL_LABELS: tuple[tuple[str, str], ...] = (
+    ("face", "人脸"),
+    ("palm", "掌静脉"),
+    ("finger", "指纹"),
+    ("password", "密码"),
+    ("card", "门卡"),
+)
+# 「门前看一眼」实时抓拍图存放目录（位于 /media/tpcamera/door-lock/ 下）
+PEEK_SUBDIR = "peek"
+PEEK_KEEP = 20                   # 只保留最近 20 张，避免长期堆积
 
 # ---- 服务 ----
 SERVICE_DOWNLOAD_CLIP = "download_clip"
@@ -182,6 +234,7 @@ SERVICE_REFRESH = "refresh"
 SERVICE_GET_PLAYBACK_URL = "get_playback_url"
 SERVICE_REFETCH_LOITER = "refetch_loiter"
 SERVICE_DELETE_LOITER = "delete_loiter"
+SERVICE_PEEK = "peek"
 
 # ---- 启动保护 ----
 # 首次取数硬超时：卡住会连带 bootstrap 一起等，前端页面就打不开
@@ -197,3 +250,14 @@ CODE_TOKEN_EXPIRED = {"10002"}          # accessToken 异常或过期 -> 重新�
 CODE_APP_KEY_INVALID = {"10005"}        # appKey 被冻结 / 不存在
 CODE_DEVICE_NOT_OWNED = {"20018"}       # 该用户不拥有该设备
 CODE_NO_PERMISSION = {"10030", "20009"} # 无权限 / 未开通白名单
+
+# ---- App 账号「统一消息列表」第三通道（2026-11-18 实测建立）----
+# 可选增强：凭据文件 /config/ezviz_lock_app.json 不存在时，集成行为与 1.6.0 完全一致。
+# 存 password 的 md5 与「已绑定终端的固定 feature_code」；与开放平台 alarm/list
+# 数据表现同源、认证体系独立，仅用于开放平台两个接口同时断供时兜底。
+APP_MSG_CONFIG_FILE = "ezviz_lock_app.json"
+APP_MSG_SYNC_INTERVAL_S = 30          # 轮询内节流：30 秒拉一次今日消息
+APP_MSG_OPEN_LOOKBACK_MS = 20_000     # 与已有开门行的去重窗口（向前）
+APP_MSG_OPEN_LOOKAHEAD_MS = 20_000    # 与已有开门行的去重窗口（向后）
+APP_MSG_LOITER_WINDOW_MS = 30_000     # 与已有徘徊行的去重窗口
+APP_MSG_SOURCE = "appmsg"             # DoorEvent.source 的第三类取值

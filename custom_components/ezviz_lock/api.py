@@ -21,6 +21,7 @@ import aiohttp
 from .const import (
     CODE_APP_KEY_INVALID,
     CODE_DEVICE_NOT_OWNED,
+    CODE_NO_PERMISSION,
     CODE_OK,
     CODE_TOKEN_EXPIRED,
     LOITER_CLIP_IDLE_S,
@@ -214,6 +215,127 @@ class EzvizApiClient:
                 f"{path} 该 AppKey 所属账号不拥有设备 {self._device_serial}：{msg}"
             )
         raise EzvizApiError(f"{path} 返回 {code}：{msg}")
+
+    # ------------------------------------------------------------------ 健康度
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        token_in_query: bool = True,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """/api/v3 系列的 GET 请求。
+
+        与 lapp 的 POST 表单有三处不同，必须分开实现：
+        1. keyValue 要求 accessToken 放在 **query string**；
+           power/status/get 与 otap 要求放在 **header**；
+        2. 成功判定可能是顶层 ``{"code":"200"}``，也可能是 ``{"meta":{"code":200}}``；
+        3. 失败信息同样分散在 ``msg`` / ``meta.message`` 两处。
+        """
+        token = await self.async_get_token()
+        query = dict(params or {})
+        hdrs = dict(headers or {})
+        if token_in_query:
+            query["accessToken"] = token
+        else:
+            hdrs["accessToken"] = token
+
+        url = f"{self._base_url}{path}"
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                async with self._session.get(url, params=query, headers=hdrs) as resp:
+                    if resp.status != 200:
+                        raise EzvizApiError(f"{path} HTTP {resp.status}")
+                    payload = await resp.json(content_type=None)
+        except asyncio.TimeoutError as err:
+            raise EzvizApiError(f"{path} 请求超时（{REQUEST_TIMEOUT}s）") from err
+        except aiohttp.ClientError as err:
+            raise EzvizApiError(f"{path} 网络错误：{err}") from err
+
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        raw_code = payload.get("code", meta.get("code", ""))
+        code = "" if raw_code is None else str(raw_code)
+        if code in (CODE_OK, "", "0"):
+            return payload
+        if code in CODE_TOKEN_EXPIRED:
+            await self.async_get_token(force=True)
+            return await self._get(path, params, token_in_query=token_in_query, headers=headers)
+        msg = payload.get("msg") or meta.get("message") or ""
+        if code in CODE_NO_PERMISSION:
+            raise EzvizPermissionError(f"{path} 无权限或未开通白名单（{code}：{msg}）")
+        raise EzvizApiError(f"{path} 返回 {code}：{msg}")
+
+    async def async_get_multi_power(
+        self, channel_no: int = 1
+    ) -> list[dict[str, Any]]:
+        """获取电量（multiPower），返回归一化后的电池条目列表。
+
+        文档：https://open.ys7.com/help/5009 「获取电量」（设备键值对查询）
+        实测：``GET /api/v3/keyValue/{sn}/{ch}/op?accessToken=..&key=multiPower``
+        返回 ``valueInfo.multiPower`` 是**字符串形式的 JSON 数组**：
+            [{"Type":0,"Name":"VideoLock","Remaining":100,"Status":0},
+             {"Type":1,"Name":"Door","Remaining":255,"Status":0}]
+        Type：0=主电源（电池组）、1=蓄电池；
+        Remaining：0~100 百分比，255 表示该电池不存在/未知；
+        Status：0 正常 / 1 充电中 / 2 充满 / 3 无电池 / 4 电池异常。
+        """
+        payload = await self._get(
+            f"/api/v3/keyValue/{self._device_serial}/{channel_no}/op",
+            {"key": "multiPower"},
+        )
+        value_info = payload.get("data") or {}
+        raw = value_info.get("valueInfo") if isinstance(value_info, dict) else None
+        raw = (raw or {}).get("multiPower") if isinstance(raw, dict) else None
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                _LOGGER.debug("multiPower 不是合法 JSON：%s", raw[:120])
+                return []
+        if isinstance(raw, dict):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, dict)]
+
+    async def async_get_power_status(self) -> str | None:
+        """查询电池充电状态（multiPower 不可用时的兜底）。
+
+        文档：https://open.ys7.com/help/1739
+        ``GET /api/v3/device/power/status/get``，token 与 deviceSerial 都放 header。
+        返回 "0"~"4"，含义见 const.POWER_STATUS_NAMES。
+        """
+        payload = await self._get(
+            "/api/v3/device/power/status/get",
+            token_in_query=False,
+            headers={"deviceSerial": self._device_serial},
+        )
+        data = payload.get("data") or {}
+        value_info = data.get("valueInfo") if isinstance(data, dict) else None
+        status = (value_info or {}).get("powerStatus") if isinstance(value_info, dict) else None
+        return None if status is None else str(status)
+
+    async def async_get_lock_users(self) -> list[dict[str, Any]]:
+        """门锁成员名单（含每类凭证数量）。
+
+        文档：https://open.ys7.com/help/1352
+        返回字段：lockUserIndex / lockUserName / faceCount / volarVeinCount /
+                 fingerCount / pwdCount / cardCount / doubleAuthStatus /
+                 expiredEnable / beginTime / endTime。
+        注意：该接口只吃 form 表单，传 JSON 会得到 50000「服务器异常」。
+        """
+        payload = await self._post(
+            "/api/lapp/keylock/user/list", {"deviceSerial": self._device_serial}
+        )
+        items = payload.get("data")
+        if isinstance(items, dict):
+            items = items.get("list") or items.get("userList")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
 
     # ------------------------------------------------------------------ 设备信息
     async def async_get_device_info(self) -> dict[str, Any]:

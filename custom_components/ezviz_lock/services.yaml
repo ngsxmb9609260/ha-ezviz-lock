@@ -94,3 +94,13 @@ delete_loiter:
       description: 多台门锁时指定条目 ID，留空则处理全部。
       selector:
         text:
+
+peek:
+  name: 门前看一眼
+  description: 同时抓拍上摄（人脸，1504×1968）与下摄（地面，1920×1080）同一时刻的画面并落盘，返回 url / upper / lower 三组带签名地址。下摄需从实时流拆帧，取流失败会自动降级为仅上摄并在 mode / note 里标明。
+  fields:
+    config_entry_id:
+      name: 配置条目
+      description: 多台门锁时指定条目 ID，留空则用第一台。
+      selector:
+        text:

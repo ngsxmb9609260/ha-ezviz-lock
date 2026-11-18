@@ -62,16 +62,44 @@
       },
       "loiter_count": {
         "name": "今日徘徊唤醒次数"
+      },
+      "battery": {
+        "name": "门锁电量"
+      },
+      "wifi_signal": {
+        "name": "WiFi 信号强度"
+      },
+      "power_status": {
+        "name": "充电状态"
+      },
+      "members": {
+        "name": "门锁成员数"
       }
     },
     "image": {
       "last_snapshot": {
         "name": "最近开门抓拍"
+      },
+      "peek_snapshot": {
+        "name": "门前一眼快照"
+      },
+      "peek_lower_snapshot": {
+        "name": "Peek lower camera"
       }
     },
     "event": {
       "door_event": {
         "name": "开门事件"
+      }
+    },
+    "binary_sensor": {
+      "online": {
+        "name": "门锁在线"
+      }
+    },
+    "button": {
+      "peek": {
+        "name": "门前看一眼"
       }
     }
   },
@@ -116,13 +144,15 @@
         }
       }
     },
-    "refetch_loiter": {
-      "name": "重取徘徊录像",
-      "description": "把还没取到录像（含被判为占位提示画面）的徘徊事件重新排一次取流。"
-    },
-    "delete_loiter": {
-      "name": "删除徘徊记录",
-      "description": "删除指定的一条徘徊唤醒记录，并一并删除它对应的录像与抓拍图。操作不可恢复。"
+    "peek": {
+      "name": "门前看一眼",
+      "description": "Capture both the upper (face) and lower (floor) cameras at the same instant and return their image URLs.",
+      "fields": {
+        "config_entry_id": {
+          "name": "配置条目",
+          "description": "多台门锁时指定条目 ID"
+        }
+      }
     }
   }
 }

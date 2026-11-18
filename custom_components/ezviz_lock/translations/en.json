@@ -44,34 +44,18 @@
   },
   "entity": {
     "sensor": {
-      "last_open_user": {
-        "name": "Last opened by"
-      },
-      "last_open_time": {
-        "name": "Last open time"
-      },
-      "last_open_type": {
-        "name": "Last unlock method"
-      },
-      "person_count": {
-        "name": "Last pass-through headcount"
-      },
-      "today_open_count": {
-        "name": "Opens today"
-      },
-      "loiter_count": {
-        "name": "Loiter alerts today"
-      }
+      "last_open_user": {"name": "Last opened by"},
+      "last_open_time": {"name": "Last open time"},
+      "last_open_type": {"name": "Last unlock method"},
+      "person_count": {"name": "Last pass-through headcount"},
+      "today_open_count": {"name": "Opens today"},
+      "loiter_count": {"name": "Loiter alerts today"}
     },
     "image": {
-      "last_snapshot": {
-        "name": "Last open snapshot"
-      }
+      "last_snapshot": {"name": "Last open snapshot"}
     },
     "event": {
-      "door_event": {
-        "name": "Door open event"
-      }
+      "door_event": {"name": "Door open event"}
     }
   },
   "services": {
@@ -83,45 +67,19 @@
       "name": "Download clip",
       "description": "Download the cloud clip of a door-open event to /local/ezviz_lock/clips/ and return a playable URL.",
       "fields": {
-        "open_time": {
-          "name": "Open time",
-          "description": "Event ISO open_time, defaults to the latest"
-        },
-        "index": {
-          "name": "Offset",
-          "description": "0 = latest, 1 = previous"
-        },
-        "config_entry_id": {
-          "name": "Config entry",
-          "description": "Config entry id when multiple locks exist"
-        }
+        "open_time": {"name": "Open time", "description": "Event ISO open_time, defaults to the latest"},
+        "index": {"name": "Offset", "description": "0 = latest, 1 = previous"},
+        "config_entry_id": {"name": "Config entry", "description": "Config entry id when multiple locks exist"}
       }
     },
     "get_playback_url": {
       "name": "Get playback URL",
       "description": "Return a playable URL for a door-open event (local mp4 first, then cloud VOD).",
       "fields": {
-        "open_time": {
-          "name": "Open time",
-          "description": "Event ISO open_time, defaults to the latest"
-        },
-        "index": {
-          "name": "Offset",
-          "description": "0 = latest"
-        },
-        "config_entry_id": {
-          "name": "Config entry",
-          "description": "Config entry id when multiple locks exist"
-        }
+        "open_time": {"name": "Open time", "description": "Event ISO open_time, defaults to the latest"},
+        "index": {"name": "Offset", "description": "0 = latest"},
+        "config_entry_id": {"name": "Config entry", "description": "Config entry id when multiple locks exist"}
       }
-    },
-    "refetch_loiter": {
-      "name": "Re-fetch loiter clips",
-      "description": "Re-queue loiter events that have no clip (including placeholder images)."
-    },
-    "delete_loiter": {
-      "name": "Delete loiter record",
-      "description": "Delete one loiter event together with its clip and snapshot. This cannot be undone."
     }
   }
 }

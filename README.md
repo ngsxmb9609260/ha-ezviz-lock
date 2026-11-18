@@ -436,6 +436,19 @@ SD_DUAL=0          # SD 侧只出 A 路（排查用）
   `import` 云脚本里的下摄参数集，少了它双路会自动降级成单路 A（画面正常、只是没有下半屏）。
   另外把 `automations.yaml` 里 `门锁云录像补录` 的延迟改成 600 秒，否则它会和 SD 链路抢同一事件。
   `automation.reload` 即可生效，不用重启 HA。
+- **升级到 v1.5~v1.8（事件源增强 + 降调用量）**：
+  - **v1.6.0**：`keylock/open/list` 云端断供时，用 `alarm/list` 的 `17011/10013` 告警兜底补开门；
+    室内开门（`open_type=5`）进表但不配图/视频；开门与录像认领窗口 20 秒。
+  - **v1.7.0**：新增**第三条数据源**——萤石 App 私有接口 `api.ys7.com/v3/unifiedmsg/list`。
+    在开放平台开门记录断供时，用 App 消息里的 17011 开门告警补行。需在
+    `/config/ezviz_lock_app.json` 放 App 账号、`password_md5`、`feature_code`（**不含明文密码**），
+    首次要短信验证码做终端绑定；无此文件则本通道自动禁用，不影响原有功能。
+  - **v1.8.0（当前）**：以 `unifiedmsg` 为今日开门实时主源；`keylock` 降到冷启动 1 次 + 每 10 分钟 1 次，
+    `alarm/list` 与 `device/info` 也都降到 10 分钟。开放平台日调用量实测从约 14592 降到约 769
+    （降 94.7%，进入试用版 1000 次/日额度内）。视频取流仍用开放平台 `live/address/get`（每事件个位数调用）。
+    `sensor.<锁>_opens_today` 属性新增 `api_call_stats` 与 `app_msg_status.source`，可直接核对通道状态。
+  - 这三个版本**不改 HACS 安装方式**，也不用重新复制 `tools/`。若没有 App 凭据文件，v1.8.0 会自动回退
+    开放平台老接口，功能不丢，只是调用量回到降频后的水平（约 576 次/天）。
 - **停用补录**：在「设置 → 自动化」停用 `门锁录像补录（SD 优先 + 云端兜底）` 与 `门锁云录像补录（慢兜底）`，或删掉 `configuration.yaml` 里的 `shell_command` 块再重启。已经拉好的 mp4 不受影响。
 - **卸载集成**：HACS 里移除 → 重启 HA。已生成的抓拍图 / 录像仍在 `/media/tpcamera/door-lock/`，按需自行清理。
 - **回滚配置**：改动前先备份 `configuration.yaml` / `automations.yaml`；脚本本身只写媒体文件与 `clean_clips.json`，不改 HA 配置、不重启 HA。

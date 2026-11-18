@@ -30,13 +30,20 @@ from .const import (
     SERVICE_GET_PLAYBACK_URL,
     SERVICE_REFETCH_LOITER,
     SERVICE_REFRESH,
+    SERVICE_PEEK,
     VERSION,
 )
 from .coordinator import DoorEvent, EzvizLockCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.IMAGE, Platform.EVENT]
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.IMAGE,
+    Platform.EVENT,
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+]
 
 ATTR_OPEN_TIME = "open_time"
 ATTR_INDEX = "index"
@@ -150,6 +157,17 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         url = await coordinator.async_playback_url(event)
         return {"url": url, "open_time": event.open_time_iso, "user_name": event.user_name}
 
+    async def handle_peek(call: ServiceCall) -> dict[str, Any]:
+        """门前看一眼：立刻抓拍一张并返回可访问地址（供面板按钮直接用）。"""
+        entry_id = call.data.get("config_entry_id")
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            if entry_id and entry.entry_id != entry_id:
+                continue
+            runtime = getattr(entry, "runtime_data", None)
+            if runtime:
+                return await runtime.coordinator.async_peek()
+        return {"url": None, "path": None, "time": None, "error": "没有可用的 ezviz_lock 配置条目"}
+
     base_schema = {
         vol.Optional(ATTR_OPEN_TIME): cv.string,
         vol.Optional(ATTR_INDEX, default=0): vol.Coerce(int),
@@ -185,6 +203,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         schema=vol.Schema({
             vol.Optional("uid"): cv.string,
             vol.Optional("time_ms"): vol.Coerce(int),
+            vol.Optional("config_entry_id"): cv.string,
+        }),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_PEEK, handle_peek,
+        schema=vol.Schema({
             vol.Optional("config_entry_id"): cv.string,
         }),
         supports_response=SupportsResponse.OPTIONAL,

@@ -8,6 +8,7 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -49,6 +50,10 @@ async def async_setup_entry(
             PersonCountSensor(coordinator, entry),
             TodayOpenCountSensor(coordinator, entry),
             LoiterCountSensor(coordinator, entry),
+            BatterySensor(coordinator, entry),
+            WifiSignalSensor(coordinator, entry),
+            PowerStatusSensor(coordinator, entry),
+            MembersSensor(coordinator, entry),
         ]
     )
 
@@ -97,6 +102,7 @@ class _BaseLockSensor(CoordinatorEntity[EzvizLockCoordinator], SensorEntity):
             "alarm_type_name": event.alarm_type_name,
             "channel_no": event.channel_no,
             "event_uid": event.uid,
+            "source": event.source,
         }
 
 
@@ -229,6 +235,7 @@ class TodayOpenCountSensor(_BaseLockSensor):
                 "snapshot_url": ev.snapshot_url,
                 "snapshot_source": ev.snapshot_source,
                 "clip_url": ev.clip_url,
+                "source": ev.source,
             }
 
         return {
@@ -246,6 +253,13 @@ class TodayOpenCountSensor(_BaseLockSensor):
             # 徘徊唤醒：前端卡片同屏切换，不必再引一个实体
             "loiter_events": [_brief_loiter(lo) for lo in data.loiter_events[:60]],
             "loiter_today_count": data.loiter_today_count,
+            # 其它告警：只留痕，不进开门/徘徊表、不配视频（主人 11-18 要求单独存一份）
+            "other_alarms": data.other_alarms[:60],
+            "other_alarms_total": len(data.other_alarms),
+            # App 通道健康快照（enabled / source / last_sync / last_error / 今日消息数 / 补行数）
+            "app_msg_status": self.coordinator.app_msg_status,
+            # v1.8.0 调用量统计：App 命中 vs 开放平台回退次数，用来直接核对降幅
+            "api_call_stats": self.coordinator.api_call_stats,
         }
 
 
@@ -280,4 +294,142 @@ class LoiterCountSensor(_BaseLockSensor):
             "loiter_total": len(events),
             "loiter_today_count": data.loiter_today_count,
             "loiter_events": [_brief_loiter(lo) for lo in events[:60]],
+        }
+
+
+# ---------------------------------------------------------------- 健康度传感器
+class _HealthSensor(_BaseLockSensor):
+    """健康度传感器基类：统一取 coordinator.data.health。"""
+
+    @property
+    def _health(self):
+        data: LockData | None = self.coordinator.data
+        return data.health if data else None
+
+
+class BatterySensor(_HealthSensor):
+    """state = 门锁电池剩余电量（%）。"""
+
+    _attr_translation_key = "battery"
+    _attr_icon = "mdi:battery"
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self.coordinator.client.device_serial}_battery"
+
+    @property
+    def native_value(self) -> int | None:
+        health = self._health
+        return health.battery_pct if health else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        health = self._health
+        if health is None:
+            return {}
+        return {
+            # 原始 multiPower 条目：Type 0=主电源 1=蓄电池
+            "battery_items": health.battery_items,
+            "spare_battery_pct": health.spare_battery_pct,
+            "power_status": health.power_status,
+            "power_status_name": health.power_status_name,
+            "last_update": health.last_update,
+            "last_error": health.last_error,
+            "source": "萤石开放平台 /api/v3/keyValue/.../op?key=multiPower",
+        }
+
+
+class WifiSignalSensor(_HealthSensor):
+    """state = 门锁 WiFi 信号强度（%），用于判断弱网。"""
+
+    _attr_translation_key = "wifi_signal"
+    _attr_icon = "mdi:wifi"
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self.coordinator.client.device_serial}_wifi_signal"
+
+    @property
+    def native_value(self) -> int | None:
+        health = self._health
+        return health.signal_pct if health else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        health = self._health
+        if health is None:
+            return {}
+        return {
+            "ssid": health.ssid,
+            "net_type": health.net_type,
+            "local_address": health.local_address,
+            "online": health.online,
+            "last_update": health.last_update,
+            "source": "萤石开放平台 /api/lapp/device/info → signal",
+        }
+
+
+class PowerStatusSensor(_HealthSensor):
+    """state = 充电状态（未充电 / 充电中 / 已充满 / 无电池 / 电池异常）。"""
+
+    _attr_translation_key = "power_status"
+    _attr_icon = "mdi:power-plug"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self.coordinator.client.device_serial}_power_status"
+
+    @property
+    def native_value(self) -> str | None:
+        health = self._health
+        return health.power_status_name if health else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        health = self._health
+        if health is None:
+            return {}
+        return {"power_status_code": health.power_status}
+
+
+class MembersSensor(_HealthSensor):
+    """state = 门锁成员数，属性带每个成员的凭证数量与最近变更记录。"""
+
+    _attr_translation_key = "members"
+    _attr_icon = "mdi:account-multiple-check"
+    _attr_native_unit_of_measurement = "人"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self.coordinator.client.device_serial}_members"
+
+    @property
+    def native_value(self) -> int | None:
+        health = self._health
+        return len(health.members) if health else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        health = self._health
+        if health is None:
+            return {}
+        members = health.members
+        return {
+            "members": [m.to_dict() for m in members],
+            "credential_total": sum(m.credential_total for m in members),
+            "face_total": sum(m.face for m in members),
+            "palm_total": sum(m.palm for m in members),
+            "finger_total": sum(m.finger for m in members),
+            "password_total": sum(m.password for m in members),
+            "card_total": sum(m.card for m in members),
+            "last_change": health.last_member_change,
+            "recent_changes": health.member_changes[:20],
+            "last_update": health.last_update,
+            "source": "萤石开放平台 /api/lapp/keylock/user/list",
         }
