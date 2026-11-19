@@ -33,7 +33,7 @@ from urllib.parse import quote, unquote
 
 from homeassistant.components.http.auth import async_sign_path
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -353,6 +353,11 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         self._today_synced = False
         # 一条告警（一张图）只能配给一个开门事件，否则会出现「室内开门拿着别人的人脸图」
         self._used_alarm_ids: set[str] = set()
+        # v1.9.3：App 消息通道入池的开门事件，告警原图走后台下载（与徘徊分支对称）。
+        # 之前这条路径只建行不配图，还先把 uid 塞进 _seen，导致 keylock 主循环
+        # 再拿到同一条时判「已见」跳过，抓拍/下载两条路全断 —— 整批事件无图。
+        self._open_snap_tasks: set[str] = set()   # 正在后台下载的 uid，防并发重复
+        self._open_img_fail: set[str] = set()     # 图本身下载失败，别每轮都重试同一张死图
         # 负缓存：这些事件「云端确实没有图」，以后不再重复请求（避免每次启动白拉一遍）
         self._no_image_uids: set[str] = set()
         self._late_fill_started = False
@@ -1512,7 +1517,8 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         分流与告警兜底一致：开门类(17011/10013)进开门表、15504 进徘徊表、
         其余（含门铃呼叫 20002）只存 other_alarms，不配视频。
         室内开门(5) 不配图/视频：_build_one 的 OUTSIDE_OPEN_TYPES 已保证。
-        本方法不下载任何媒体，回填只走本地存档与 SD 白名单。
+        v1.9.3：开门/徘徊的告警原图交给后台任务下载（不阻塞本方法），
+        SD 录像回填仍只走本地存档与白名单。
         """
         now_mono = time.monotonic()
         if (
@@ -1540,6 +1546,10 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         self._app_msg_status["messages_today"] = len(messages)
 
         added_opens: list[DoorEvent] = []
+        # v1.9.3：开门事件入池时一起记下它自己的告警，入池后后台下载原图。
+        # 没有这一步，appmsg 建的行就永远没有 snapshot_url（keylock 主循环
+        # 因 uid 已在 _seen 里而不再处理它）。
+        pending_open_alarm: dict[str, AlarmRecord] = {}
         added_loiter: list[LoiterEvent] = []
         other_new: list[dict[str, Any]] = []
         existing_other_ids = {
@@ -1600,6 +1610,13 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 ev.alarm_type = ev.alarm_type or atype
                 ev.alarm_type_name = ev.alarm_type_name or self.alarm_type_name(atype)
                 added_opens.append(ev)
+                # v1.9.3：记下这条事件自己的告警，入池后后台下载那张门外原图。
+                if (
+                    msg.pic_url
+                    and not ev.snapshot_path
+                    and ev.open_type in OUTSIDE_OPEN_TYPES
+                ):
+                    pending_open_alarm[ev.uid] = alarm
                 continue
 
             # ---- 徘徊：与已有徘徊行按时间窗去重；不主动触发录像下载 ----
@@ -1659,11 +1676,13 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
 
         if added_opens:
             known = {e.uid for e in self._events}
+            appended_uids: set[str] = set()
             for ev in sorted(added_opens, key=lambda e: e.open_time_ms, reverse=True):
                 if ev.uid in known:
                     continue
                 self._events.append(ev)
                 known.add(ev.uid)
+                appended_uids.add(ev.uid)
                 self._seen.add(ev.uid)
                 self.hass.bus.async_fire(EVENT_DOOR_OPENED, ev.to_dict())
                 _LOGGER.info(
@@ -1672,6 +1691,17 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 )
             self._events.sort(key=lambda e: e.open_time_ms, reverse=True)
             self._events = self._events[:MAX_KEEP_EVENTS]
+            # v1.9.3：只给真正入池的事件补图；重复被丢弃的别白下一遍。
+            # 后台下载不阻塞本方法（轮询里 await 下载曾把启动拖到 90 秒）。
+            for ev in added_opens:
+                if ev.uid not in appended_uids or ev.uid not in pending_open_alarm:
+                    continue
+                if ev.uid in self._open_snap_tasks or ev.uid in self._open_img_fail:
+                    continue
+                self._open_snap_tasks.add(ev.uid)
+                self.hass.async_create_task(
+                    self._async_bg_open_snapshot(ev, pending_open_alarm[ev.uid])
+                )
 
         if added_loiter:
             self._loiter.sort(key=lambda x: x.time_ms, reverse=True)
@@ -1687,6 +1717,11 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         self._app_msg_status["added_loiter"] = len(added_loiter)
         self._app_msg_status["other_logged"] = len(other_new)
 
+        # v1.9.3：10:15 起那批无图事件的 msgId 已在 _app_msg_seen 里，正常分支
+        # 不会再处理它们。这里拿本轮消息按 alarm_id / 时间窗配对，把当时漏下的
+        # 告警原图补回来（纯 HTTP，不触发设备抓拍）。
+        self._backfill_app_open_snapshots(messages)
+
         if added_opens or added_loiter or other_new:
             # 回填只走本地存档与 SD 白名单，不再额外请求云端
             try:
@@ -1695,6 +1730,87 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             except Exception:  # noqa: BLE001
                 _LOGGER.debug("App 消息补录后回填失败（下轮重试）")
             await self._async_save_state()
+            self.async_update_listeners()
+
+    def _backfill_app_open_snapshots(self, messages: list[Any]) -> None:
+        """给今日已入池但无图的开门事件补下 App 消息里的告警原图。
+
+        只匹配本轮拉到的消息：先按 alarm_id 精确配，配不上再按
+        ±APP_MSG_OPEN_LOOKBACK_MS 时间窗取最近一张带图开门告警。
+        绝不把别的时间点的图贴上来（宁可无图，不许造假）。
+        """
+        targets = [
+            ev
+            for ev in self._events
+            if not ev.is_close
+            and not ev.snapshot_path
+            and ev.open_type in OUTSIDE_OPEN_TYPES
+            and ev.uid not in self._open_snap_tasks
+            and ev.uid not in self._open_img_fail
+        ]
+        if not targets or not messages:
+            return
+
+        def _to_alarm(msg: Any) -> AlarmRecord:
+            return AlarmRecord(
+                alarm_id=msg.msg_id,
+                alarm_type=msg.alarm_type,
+                alarm_time=msg.event_time_ms,
+                pic_url=msg.pic_url,
+                channel_no=msg.channel,
+                rec_state=msg.rec_state,
+                pre_time=msg.pre_time,
+                delay_time=msg.delay_time,
+                customer_info=msg.customer_info,
+            )
+
+        n = 0
+        for ev in targets:
+            alarm: AlarmRecord | None = None
+            if ev.alarm_id:
+                alarm = next(
+                    (
+                        _to_alarm(m)
+                        for m in messages
+                        if m.msg_id == ev.alarm_id and m.pic_url
+                    ),
+                    None,
+                )
+            if alarm is None:
+                best_delta: int | None = None
+                for m in messages:
+                    if not m.pic_url or m.alarm_type not in OPEN_ALARM_TYPES:
+                        continue
+                    delta = abs(m.event_time_ms - ev.open_time_ms)
+                    if delta > APP_MSG_OPEN_LOOKBACK_MS:
+                        continue
+                    if best_delta is None or delta < best_delta:
+                        best_delta = delta
+                        alarm = _to_alarm(m)
+            if alarm is None:
+                continue
+            self._open_snap_tasks.add(ev.uid)
+            self.hass.async_create_task(self._async_bg_open_snapshot(ev, alarm))
+            n += 1
+        if n:
+            _LOGGER.info("App 消息补下开门告警图 %d 条（后台）", n)
+
+    async def _async_bg_open_snapshot(self, ev: DoorEvent, alarm: AlarmRecord) -> None:
+        """后台下载一张 App 消息带来的开门告警原图，失败只记一次不再重试。"""
+        try:
+            await self._async_archive_snapshot(ev, alarm)
+            if ev.snapshot_path:
+                await self._async_save_state()
+                _LOGGER.info("开门告警图已存档：%s / %s", ev.open_time_iso, ev.snapshot_url)
+            else:
+                self._open_img_fail.add(ev.uid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - 单张图失败不影响任何主流程
+            _LOGGER.warning("开门告警图保存失败（%s）：%s", ev.open_time_iso, err)
+            self._open_img_fail.add(ev.uid)
+        finally:
+            self._open_snap_tasks.discard(ev.uid)
             self.async_update_listeners()
 
     # ------------------------------------------------------------------ 徘徊唤醒
@@ -2642,34 +2758,41 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             return stamp, ok, fp
 
         def _scan_quick():
-            """冷启动快路径：只 stat，不读录像内容；任一指纹不符即返回 None。"""
+            """冷启动快路径：只 stat，不读录像内容。
+
+            v1.9.4 修复：以前只要索引里**有一条**指纹缺失或不符，就整份判失效，
+            而拉流脚本每新增一段录像都会改写 clean_clips.json —— 于是每次新增
+            都把全部录像清空，前端表现为「有录像文件却什么都打不开」。
+            现在改为逐条筛：有指纹且 stat 一致的片段照常上线，
+            新增/变动的片段本轮先不挂，交给后台全量复核补。
+            """
             stamp = _read_stamp()
             if stamp is None:
-                return None
-            cache = self._clean_cache
-            if cache.get("stamp") != list(stamp):
-                return None
-            files = cache.get("files")
-            if not isinstance(files, dict) or not files:
                 return None
             entries = _read_entries()
             if entries is None:
                 return None
+            files = self._clean_cache.get("files")
+            if not isinstance(files, dict) or not files:
+                return None
+            safe: list[dict[str, Any]] = []
             for c in entries:
-                rel = c["rel"]
-                expect = files.get(rel)
+                expect = files.get(c["rel"])
                 if not isinstance(expect, list) or len(expect) != 2:
-                    return None
-                p = self._media_root / rel
+                    continue  # 缓存里还没有它的指纹（新片段）→ 等复核
+                p = self._media_root / c["rel"]
                 try:
                     if not p.is_file():
-                        return None
+                        continue
                     st = p.stat()
                 except OSError:
-                    return None
+                    continue
                 if [st.st_size, st.st_mtime_ns] != list(expect):
-                    return None
-            return stamp, entries, None
+                    continue  # 文件被换过 → 不可信
+                safe.append(c)
+            if not safe:
+                return None
+            return stamp, safe, None
 
         # 同一进程内的轮询直接复用；全量复核必须绕过这一层
         if not force_full and self._clean_index_stamp is not None:
@@ -2715,6 +2838,9 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             _LOGGER.info("干净录像白名单已在后台完成全量 MD5 复核（%d 段）", len(clips))
         elif clips:
             _LOGGER.info("复用已验证的干净录像索引 %d 段，供前端按时间匹配", len(clips))
+            # v1.9.4：快路径只挂「有指纹且 stat 一致」的片段，索引里的新增片段
+            # 还没验过。这里补一次后台全量复核，把新增的也验进来（不占启动路径）。
+            self._schedule_clean_verify()
         return clips
 
     def _abs_to_url(self, path: Path) -> str:
@@ -2906,7 +3032,11 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             self.hass, 30, self._async_start_clean_verify
         )
 
+    @callback
     def _async_start_clean_verify(self, _now: Any) -> None:
+        """定时器回调：必须 @callback，否则会在事件循环外执行，
+        async_create_task 拿不到 loop，协程被丢弃（日志 "was never awaited"），
+        白名单就永远补不回来。"""
         self._clean_verify_cancel = None
         task = self._clean_verify_task
         if task is not None and not task.done():
@@ -2926,12 +3056,32 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
 
     async def _async_verify_clean_clips(self) -> None:
         """启动后做一次全量 MD5，结果写回状态供下次冷启动复用。"""
+        before = len(self.clean_clips)
         try:
             await self._async_load_clean_clips(force_full=True)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 复核失败绝不能影响主循环
             _LOGGER.exception("后台复核干净录像白名单失败")
+            return
+        # v1.9.4：启动快路径只挂「有指纹」的旧片段，新增片段要等这次复核。
+        # 复核补齐白名单后必须重新认领一次录像地址，否则启动时被清掉的
+        # clip_url 永远挂不回来 —— 前端表现就是「有录像文件但打不开」。
+        if before > 0 and len(self.clean_clips) == before:
+            return
+        try:
+            await self._async_backfill_clips(self._events)
+            await self._async_save_state()
+            self.async_update_listeners()
+            _LOGGER.info(
+                "复核完成后重新认领录像：白名单 %d 段，事件带录像 %d 条",
+                len(self.clean_clips),
+                sum(1 for e in self._events if e.clip_url),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("复核后重新认领录像失败")
 
     async def _async_late_fill_snapshots(self) -> None:
         """给今天缺图的门外开门补下载告警原图（后台执行，失败不影响实体）。"""
