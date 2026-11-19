@@ -11,7 +11,7 @@ from __future__ import annotations
 
 DOMAIN = "ezviz_lock"
 NAME = "EZVIZ Lock"
-VERSION = "1.8.0"
+VERSION = "1.9.2"
 
 # ---- 配置键 ----
 CONF_APP_KEY = "app_key"
@@ -27,6 +27,7 @@ CONF_USER_ALIASES = "user_aliases"
 CONF_REGION_HOST = "region_host"
 CONF_AUTO_DOWNLOAD_CLIP = "auto_download_clip"
 CONF_CAPTURE_ON_EVENT = "capture_on_event"
+CONF_COVER_FIRST = "cover_first"
 
 DEFAULT_CHANNEL_NO = 1
 DEFAULT_SCAN_INTERVAL = 20          # 秒：越短，事件触发抓拍越可能拍到人
@@ -34,6 +35,11 @@ DEFAULT_MERGE_WINDOW = 12           # 秒：同一次通行事件的聚合窗口
 DEFAULT_SNAPSHOT_RETENTION = 90     # 天
 DEFAULT_AUTO_DOWNLOAD_CLIP = False
 DEFAULT_CAPTURE_ON_EVENT = True     # 发现新开门时立即抓拍一张当前画面
+# v1.9.1（主人定的 B 方案）：capture 保底 + 云封面兜底 —— 新事件仍**立刻抓拍**，
+# 抓拍失败才改用云存储片段的 coverPic 补图。封面与告警图同源（设备没拍就没有），
+# 所以只能兜底，不能替代抓拍。
+# 该开关设为 True 才回到旧的 C 模式（先等封面 5 分钟、超时再抓拍），默认关闭。
+DEFAULT_COVER_FIRST = False
 DEFAULT_REGION_HOST = "https://open.ys7.com"
 
 # 可选区域节点（海外/国内镜像），填入配置项 region_host
@@ -261,3 +267,15 @@ APP_MSG_OPEN_LOOKBACK_MS = 20_000     # 与已有开门行的去重窗口（向�
 APP_MSG_OPEN_LOOKAHEAD_MS = 20_000    # 与已有开门行的去重窗口（向后）
 APP_MSG_LOITER_WINDOW_MS = 30_000     # 与已有徘徊行的去重窗口
 APP_MSG_SOURCE = "appmsg"             # DoorEvent.source 的第三类取值
+
+# ---- v1.9.0 云封面补图 ----
+# 事件配图优先取云存储片段的 coverPic：实测（11-19）清单里的封面就是门外
+# 事件首帧 JPEG（1080×1440、200~260KB），走 alicloud HTTP，不吃开放平台配额、
+# 不需要设备在线。代价是片段要等设备上传完才出现在列表里，所以必须等。
+COVER_WAIT_S = 300            # 事件后最多等 5 分钟：期间每次轮询都试着匹配封面
+COVER_POLL_INTERVAL_S = 60    # 拉一次云的节流（一次请求可匹配多条事件，成本极低）
+COVER_MATCH_BEFORE_S = 3      # 允许事件早于片段起点多少秒（实测偏差 -2~-5 s）
+COVER_MATCH_AFTER_S = 3       # 允许事件晚于片段终点多少秒
+COVER_MAX_PER_CYCLE = 3       # 一轮最多下载几张，避免同时开一堆下载拖慢轮询
+COVER_MIN_BYTES = 10_000      # 封面图下限：实测 193~263 KB，小于 10 KB 基本是错误页/空图
+COVER_BACKFILL_AGE_S = 86400  # 启动时回溯补图只补最近 24 小时内的无图事件

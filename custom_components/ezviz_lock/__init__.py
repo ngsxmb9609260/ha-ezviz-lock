@@ -267,6 +267,9 @@ async def _async_update_options(hass: HomeAssistant, entry: EzvizLockConfigEntry
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EzvizLockConfigEntry) -> bool:
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime is not None:
+        runtime.coordinator.async_cancel_clean_verify()
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)

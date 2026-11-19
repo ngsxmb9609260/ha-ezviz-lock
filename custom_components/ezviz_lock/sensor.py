@@ -260,6 +260,8 @@ class TodayOpenCountSensor(_BaseLockSensor):
             "app_msg_status": self.coordinator.app_msg_status,
             # v1.8.0 调用量统计：App 命中 vs 开放平台回退次数，用来直接核对降幅
             "api_call_stats": self.coordinator.api_call_stats,
+            # v1.9.0 云封面补图统计：成功/未匹配/回落抓拍/回溯，以及待补条数
+            "cover_stats": self.coordinator.cover_stats,
         }
 
 

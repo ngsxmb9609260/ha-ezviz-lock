@@ -62,8 +62,18 @@ class DoorRecord:
 
     @property
     def uid(self) -> str:
-        """去重主键：同一毫秒同方式同人员视为同一条。"""
-        return f"{self.open_time}|{self.open_type}|{self.user_name}"
+        """去重主键：**按秒归一化**后「同方式同人员」视为同一条。
+
+        v1.8.1 修正（实测 2026-11-19）：三条链路上报的时间精度不一致——
+          * keylock/open/list 是整秒（毫秒位恒为 000，如 1795047001000）
+          * App unifiedmsg 是真实毫秒（如 1795047001602）
+          * alarm/list 的开门告警同样是毫秒
+        同一次开门因此会得到两个只差几百毫秒、却完全不同的主键，
+        `_seen` / `known` 的精确匹配全都挡不住，页面上就出现两条相同的记录。
+        统一截断到秒即可对齐；同方式同人员的两次真实开门物理上不可能落在同一秒内
+        （中间必须经历关门），所以秒级粒度不会误合并。
+        """
+        return f"{self.open_time // 1000}|{self.open_type}|{self.user_name}"
 
 
 @dataclass(slots=True)

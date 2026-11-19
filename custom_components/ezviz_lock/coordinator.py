@@ -34,6 +34,7 @@ from urllib.parse import quote, unquote
 from homeassistant.components.http.auth import async_sign_path
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -41,6 +42,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AlarmRecord, DoorRecord, EzvizApiClient, EzvizApiError
 from .app_msg import (
+    AppCloudClip,
     AppDataUnavailable,
     AppMsgConfigError,
     AppMsgError,
@@ -68,6 +70,7 @@ from .const import (
     CONF_AUTO_DOWNLOAD_CLIP,
     CONF_CAPTURE_ON_EVENT,
     CONF_CHANNEL_NO,
+    CONF_COVER_FIRST,
     CONF_DEVICE_SERIAL,
     CONF_MERGE_WINDOW,
     CONF_SCAN_INTERVAL,
@@ -77,6 +80,7 @@ from .const import (
     DEFAULT_AUTO_DOWNLOAD_CLIP,
     DEFAULT_CAPTURE_ON_EVENT,
     DEFAULT_CHANNEL_NO,
+    DEFAULT_COVER_FIRST,
     DEFAULT_MERGE_WINDOW,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SNAPSHOT_RETENTION,
@@ -106,6 +110,13 @@ from .const import (
     PLACEHOLDER_MAX_BYTES,
     PLACEHOLDER_MIN_WIDTH,
     CLIP_RETRY_DELAY_S,
+    COVER_BACKFILL_AGE_S,
+    COVER_MATCH_AFTER_S,
+    COVER_MATCH_BEFORE_S,
+    COVER_MAX_PER_CYCLE,
+    COVER_MIN_BYTES,
+    COVER_POLL_INTERVAL_S,
+    COVER_WAIT_S,
     SIGNED_URL_DAYS,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -349,6 +360,11 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         # 逐帧验收过的干净录像索引（前端按时间就近匹配开门记录），见 clean_clips.json
         self.clean_clips: list[dict[str, Any]] = []
         self._clean_index_stamp: tuple[int, int] | None = None
+        # v1.9.2：上次全量 MD5 验证通过的索引指纹（持久化），冷启动直接复用，
+        # 不再让 bootstrap 等 30 段录像的 MD5；后台仍会做一次完整复核。
+        self._clean_cache: dict[str, Any] = {}
+        self._clean_verify_task: asyncio.Task | None = None
+        self._clean_verify_cancel: Any = None
 
         # ---- 徘徊唤醒 ----
         self._loiter: list[LoiterEvent] = []
@@ -415,6 +431,31 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         self._last_device_info_probe = 0.0
         self._device_probe_interval_s = 600.0
 
+        # ---- v1.9.1 配图策略：capture 保底 + 云封面兜底 ----
+        # 新事件仍然立刻 device/capture 抓一张（到得最快、对得上人）；只有抓拍失败
+        # 或事件本来就拍不到图时，才去云存储片段里取 coverPic 兜底。封面走
+        # alicloud HTTP，不吃开放平台配额、不需要设备在线，但与告警图同源
+        # （设备没拍的事件云里也没有），所以只能兜底。
+        self._cover_first = bool(
+            entry.options.get(CONF_COVER_FIRST, DEFAULT_COVER_FIRST)
+        )
+        self._cover_pending: dict[str, DoorEvent] = {}   # uid → 事件（待补封面）
+        self._cover_deadline: dict[str, float] = {}       # uid → 放弃时刻（monotonic）
+        self._cover_done: set[str] = set()                # 已成功或已放弃，不再重试
+        self._cover_tasks: set[str] = set()               # 正在下载中的 uid
+        self._cloud_clips: list[AppCloudClip] = []
+        self._cloud_clips_at = 0.0                        # 上次拉列表的 monotonic
+        self._cloud_clip_seen: set[str] = set()           # 已用过的片段 key
+        self._cover_stats: dict[str, int] = {
+            "cloud_ok": 0,      # 云封面兜底成功
+            "cloud_miss": 0,    # 等到过期也没匹配到片段
+            "capture_fail": 0,  # 抓拍失败转封面兜底的次数
+            "capture_fallback": 0,  # 仅 C 模式：等不到封面后回落抓拍的次数
+            "backfill": 0,      # 历史事件回溯补图成功
+        }
+        self._backfill_queued = False    # 首轮回溯只跑一次
+        self._last_capture_at = 0.0      # C 模式兜底抓拍 60 秒节流
+
     @property
     def app_msg_status(self) -> dict[str, Any]:
         """App 通道健康快照（供传感器属性与巡检观察）。"""
@@ -424,6 +465,16 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
     def api_call_stats(self) -> dict[str, int]:
         """开放平台调用节省统计（只读快照）。"""
         return dict(self._api_call_stats)
+
+    @property
+    def cover_stats(self) -> dict[str, Any]:
+        """云封面补图统计（只读快照，供传感器属性观察）。"""
+        return {
+            **self._cover_stats,
+            "cover_first": self._cover_first,
+            "pending": len(self._cover_pending),
+            "cloud_clips": len(self._cloud_clips),
+        }
 
     # ------------------------------------------------------------------ 配置辅助
     def _build_user_alias_map(self, raw: str) -> dict[str, str]:
@@ -496,7 +547,11 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
     # ------------------------------------------------------------------ 持久化
     async def async_load_state(self) -> None:
         stored = await self._store.async_load() or {}
-        self._seen = set(stored.get("seen") or [])
+        # v1.8.1：seen 里存的是旧版毫秒级 uid，先统一换算成秒级主键，
+        # 否则历史去重后这些事件会被当成「新记录」再推一遍通知。
+        self._seen = {
+            self._normalize_event_uid(u) for u in (stored.get("seen") or [])
+        }
         for raw in stored.get("events") or []:
             try:
                 raw.pop("open_time_iso", None)
@@ -515,9 +570,29 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 if ev.user_name_raw:
                     ev.user_name = self.display_user_name(ev.user_name_raw)
             self._events.append(ev)
+        # v1.8.1 迁移：旧版本把同一次开门按毫秒精度存成了多条（keylock 整秒 vs
+        # App/alarm 毫秒），历史数据不会自己消失。按新的秒级主键合并一次，
+        # 保留信息最完整的那条（有图 > 有告警号 > 有录像 > 有真实人数）。
+        _before_events = len(self._events)
+        self._events = self._dedupe_events_by_second(self._events)
+        # 去重后把新主键并进 seen：既覆盖被合并掉的那批旧 uid，也不会漏掉存活记录
+        self._seen.update(ev.uid for ev in self._events)
+        if len(self._events) != _before_events:
+            _LOGGER.info(
+                "历史开门记录去重：%d 条 → %d 条（合并了 %d 条同一次开门的重复行）",
+                _before_events,
+                len(self._events),
+                _before_events - len(self._events),
+            )
         self._initialized = bool(stored.get("initialized"))
+        # v1.9.2：复用上次已全量验过的干净录像索引指纹（见 _async_load_clean_clips）
+        cache = stored.get("clean_clips_cache")
+        self._clean_cache = cache if isinstance(cache, dict) else {}
         # 「云端确认没有图」的事件，持久化下来，避免每次启动都去白拉一遍
-        self._no_image_uids = set(stored.get("no_image") or [])
+        # v1.8.1：同样换算成秒级主键，否则去重后这张「没图」名单会全部失效
+        self._no_image_uids = {
+            self._normalize_event_uid(u) for u in (stored.get("no_image") or [])
+        }
         # ---- 徘徊唤醒 ----
         self._deleted_loiter = set(stored.get("deleted_loiter") or [])
         for raw in stored.get("loiter") or []:
@@ -541,6 +616,18 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             self._loiter.append(lo)
             self._loiter_seen.add(lo.uid)
         self._loiter.sort(key=lambda x: x.time_ms, reverse=True)
+        # v1.8.1 迁移：同一次徘徊被 App 与 alarm/list 各存了一条（msg_id 不同、时间完全相同），
+        # 历史数据按「同类型 + 时间一致」合并，并重建去重索引。
+        _before_loiter = len(self._loiter)
+        self._loiter = self._dedupe_loiter_by_time(self._loiter)
+        self._loiter_seen = {lo.uid for lo in self._loiter}
+        if len(self._loiter) != _before_loiter:
+            _LOGGER.info(
+                "历史徘徊记录去重：%d 条 → %d 条（合并了 %d 条同一次徘徊的重复行）",
+                _before_loiter,
+                len(self._loiter),
+                _before_loiter - len(self._loiter),
+            )
         # ---- 告警驱动：兜底开门 + 其它告警留痕 ----
         self._alarm_open_seen = set(stored.get("alarm_open_seen") or [])
         self._other_alarms = list(stored.get("other_alarms") or [])
@@ -570,6 +657,76 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             len(self._events), len(self._loiter), len(self._seen),
         )
 
+    @staticmethod
+    def _normalize_event_uid(uid: str) -> str:
+        """把旧版毫秒级事件主键换算成 v1.8.1 的秒级主键。
+
+        形如 `1795047001602|5|用户` → `1795047001|5|用户`。
+        不是三段的（例如 appmsg:xxx 这类别的主键）原样返回，不做任何猜测。
+        """
+        parts = str(uid).split("|")
+        if len(parts) == 3 and parts[0].isdigit():
+            return f"{int(parts[0]) // 1000}|{parts[1]}|{parts[2]}"
+        return str(uid)
+
+    @staticmethod
+    def _dedupe_events_by_second(events: list[DoorEvent]) -> list[DoorEvent]:
+        """按「秒级主键」合并同一次开门的历史重复行（v1.8.1）。
+
+        主键与 DoorRecord.uid 保持一致：秒 | 方式 | 原始人名。
+        DoorEvent 持久化的是显示名，所以 user_name_raw 优先；关门事件没有人员名，
+        keylock 侧统一是「未知用户」，同样能对齐。合并后把 uid 就地改写成新主键，
+        这样 _seen 的精确匹配才会生效。
+        """
+
+        def _key(ev: DoorEvent) -> str:
+            name = ev.user_name_raw or ev.user_name
+            return f"{ev.open_time_ms // 1000}|{ev.open_type}|{name}"
+
+        def _score(ev: DoorEvent) -> tuple[int, ...]:
+            # 信息完整度排序：有图 > 有告警号 > 有录像 > 真实人数
+            return (
+                1 if (ev.snapshot_path or ev.snapshot_url) else 0,
+                1 if ev.alarm_id else 0,
+                1 if (ev.clip_path or ev.clip_url) else 0,
+                0 if ev.person_count_source in ("default", "n/a") else 1,
+                ev.person_count or 0,
+            )
+
+        best: dict[str, DoorEvent] = {}
+        for ev in events:
+            key = _key(ev)
+            cur = best.get(key)
+            if cur is None or _score(ev) > _score(cur):
+                best[key] = ev
+        for key, ev in best.items():
+            ev.uid = key
+        return sorted(best.values(), key=lambda e: e.open_time_ms, reverse=True)
+
+    @staticmethod
+    def _dedupe_loiter_by_time(items: list[LoiterEvent]) -> list[LoiterEvent]:
+        """合并「同类型 + 时间完全相同」的徘徊重复行（v1.8.1）。
+
+        两种消息号（App 与 alarm/list）的 time_ms 实测完全一致，所以历史数据用
+        精确相等即可，绝不会误合并真实的两起徘徊。运行期的判重仍用时间窗
+        （见 _async_sync_loiter），两者用途不同。
+        """
+
+        def _score(lo: LoiterEvent) -> tuple[int, ...]:
+            return (
+                1 if lo.snapshot_path else 0,
+                1 if lo.clip_path else 0,
+                1 if lo.clip_status == "ready" else 0,
+            )
+
+        best: dict[tuple[int, int], LoiterEvent] = {}
+        for lo in items:
+            key = (lo.alarm_type, lo.time_ms)
+            cur = best.get(key)
+            if cur is None or _score(lo) > _score(cur):
+                best[key] = lo
+        return sorted(best.values(), key=lambda x: x.time_ms, reverse=True)
+
     async def _async_save_state(self) -> None:
         await self._store.async_save(
             {
@@ -598,6 +755,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 "alarm_open_seen": sorted(self._alarm_open_seen)[-1000:],
                 "other_alarms": self._other_alarms[:OTHER_ALARMS_KEEP_MAX],
                 "app_msg_seen": sorted(self._app_msg_seen)[-1000:],
+                "clean_clips_cache": self._clean_cache,
             }
         )
 
@@ -694,6 +852,16 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             await self._async_ensure_app_client()
         except Exception as err:  # noqa: BLE001 - 初始化失败不能拖垮集成
             _LOGGER.debug("App 通道初始化失败：%s", err)
+
+        # 首轮：把最近 24 小时「有开门但没图」的事件排进云封面回溯队列。
+        # 这些多是重启后从历史重建的记录（重建路径不抓拍），云封面不依赖设备在线，
+        # 正好能补上；跑一次即可，之后新事件走实时队列。
+        if not self._backfill_queued:
+            self._backfill_queued = True
+            try:
+                self._queue_backfill_covers()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("云封面回溯排队失败")
 
         try:
             # 设备名只需取一次；设备信息探测（在线/WiFi/信号）本身由 health 负责，
@@ -864,6 +1032,16 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             _LOGGER.exception("同步徘徊事件失败")
         _mark("徘徊同步")
 
+        # v1.9.0 云封面补图：给「等封面」的事件匹配云录像片段并下载。
+        # 拉列表按 60 秒节流，一次请求可匹配多条事件；失败只降级不报错。
+        try:
+            await self._async_sync_cloud_covers()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 补图失败不能影响主链路
+            _LOGGER.exception("云封面补图失败")
+        _mark("云封面")
+
         # SD 回放录像认领：拉取器每小时补一段，补完无需重启就能挂到对应开门记录。
         # 节流 120 秒，避免每轮 20s 都遍历媒体目录 + 复核白名单 md5。
         _now_mono = time.monotonic()
@@ -934,7 +1112,17 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         )
 
     async def _async_capture_for_new(self, events: list[DoorEvent]) -> None:
-        """给刚发现的真实开门补拍当前画面（只在没有告警原图时）。"""
+        """给刚发现的真实开门配图（v1.9.1：capture 保底 + 云封面兜底）。
+
+        顺序固定「先抓拍、后补封面」：
+          1. 立刻 ``device/capture`` 拍一张实时画面 —— 到得最快，也对得上门外的人；
+          2. 抓拍失败（设备睡着 / 平台报错 / 返回空）时，这条事件才排进「等云封面」
+             队列，由轮询去云存储片段取 ``coverPic`` 兜底（不吃配额、不依赖设备在线）；
+          3. 抓拍成功时，同一批里其余还没图的事件也排进封面队列（它们本来就无图）。
+
+        云封面与告警抓拍同源：设备没拍的事件云里也没有，所以只作兜底。
+        ``CONF_COVER_FIRST=True`` 才走旧的 C 模式（先等封面、超时再抓拍），默认关闭。
+        """
         if not self._capture_enabled:
             return
         # 室内按键（5）/机械钥匙（8）补拍到的是同一个门外镜头，拍了也对不上人，直接不拍
@@ -945,17 +1133,224 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         ]
         if not targets:
             return
-        # 同一轮多条时，只给最新那条拍（其余共用不了不同时刻的画面）
+
+        if self._cover_first and self._app_msg_client is not None:
+            # 旧 C 模式：全部入队等封面，一轮里多条事件各自去匹配各自的片段。
+            for ev in targets:
+                self._queue_cover(ev)
+            _LOGGER.debug("已排入云封面等待队列 %d 条", len(targets))
+            return
+
+        # B 模式：立刻抓拍最新一条（画面最接近本次开门）
         target = max(targets, key=lambda e: e.open_time_ms)
+        url: str | None = None
         try:
             url = await self.client.async_capture(channel_no=self._channel_no)
         except EzvizApiError as err:
-            _LOGGER.warning("实时抓拍失败（该条记录将没有图片）：%s", err)
+            _LOGGER.warning("实时抓拍失败，改用云封面兜底（%s）：%s", target.open_time_iso, err)
+
+        if not url:
+            self._cover_stats["capture_fail"] += 1
+            if self._app_msg_client is None:
+                _LOGGER.warning("实时抓拍未拿到图片，且 App 通道未启用 → 该批记录将没有图片")
+                return
+            for ev in targets:
+                self._queue_cover(ev)
+            _LOGGER.info("实时抓拍无图 %d 条，已排入云封面兜底队列", len(targets))
+            return
+
+        await self._async_archive_capture(target, url)
+
+        # 抓拍只覆盖了最新一条；同批其余事件本来就无图，交给云封面补（有就补，没有算了）
+        rest = [e for e in targets if e is not target]
+        if rest and self._app_msg_client is not None:
+            for ev in rest:
+                self._queue_cover(ev)
+            _LOGGER.debug("同批其余 %d 条无图事件已排入云封面队列", len(rest))
+
+    # ------------------------------------------------------------------ 云封面补图
+    def _queue_cover(self, ev: DoorEvent, *, force: bool = False) -> None:
+        """把一条无图事件排进「等云封面」队列。
+
+        force=True 用于历史回溯：即使已过 wait 窗口也排一次，deadline 立即生效
+        （下一轮就会拉列表尝试，拉不到就结束，不会长时间占着队列）。
+        """
+        if not ev.uid or ev.snapshot_path:
+            return
+        if ev.uid in self._cover_done or ev.uid in self._cover_pending:
+            return
+        self._cover_pending[ev.uid] = ev
+        wait = COVER_WAIT_S if not force else 0
+        self._cover_deadline[ev.uid] = time.monotonic() + wait
+
+    def _queue_backfill_covers(self) -> None:
+        """启动后回溯：最近 24 小时内「门外开门但没有图」的事件也去试着补一张。
+
+        这些记录多半是集成重启后从历史重建的（重建路径不抓拍），或者当时
+        capture 失败。云封面不依赖设备在线，正好能补上；纯 HTTP 拉图，不动设备。
+        """
+        if self._app_msg_client is None:
+            return
+        cutoff = int(time.time() * 1000) - COVER_BACKFILL_AGE_S * 1000
+        n = 0
+        for ev in self._events:
+            if ev.is_close or ev.open_type not in OUTSIDE_OPEN_TYPES:
+                continue
+            if ev.snapshot_path or ev.open_time_ms < cutoff:
+                continue
+            if ev.uid in self._cover_done or ev.uid in self._cover_pending:
+                continue
+            self._queue_cover(ev, force=True)
+            n += 1
+        if n:
+            _LOGGER.info("云封面回溯：%d 条历史无图事件加入补图队列", n)
+
+    def _match_cloud_clip(self, open_ms: int) -> AppCloudClip | None:
+        """在云录像片段里找与开门时刻对应的那一段。
+
+        判定用「片段区间 ± 容差」，不是「最近片段」：宁可没图，也不许把
+        58 秒后另一件事的录像贴给这次开门（那是造假）。
+        """
+        best: AppCloudClip | None = None
+        for c in self._cloud_clips:
+            if not c.cover_url or c.key in self._cloud_clip_seen:
+                continue
+            lo = c.start_ms - COVER_MATCH_BEFORE_S * 1000
+            hi = c.start_ms + max(c.video_long_ms, 1000) + COVER_MATCH_AFTER_S * 1000
+            if lo <= open_ms <= hi:
+                if best is None or abs(open_ms - c.start_ms) < abs(open_ms - best.start_ms):
+                    best = c
+        return best
+
+    async def _async_sync_cloud_covers(self) -> None:
+        """给「等封面」的事件匹配云录像片段并下载。
+
+        每个轮询周期调用一次；拉列表本身按 ``COVER_POLL_INTERVAL_S`` 节流
+        （一次请求可匹配多条事件，成本极低）。等到 deadline 仍无片段 → 记 miss；
+        只有 C 模式（``_cover_first``）才会在此时回落 device/capture，B 模式下
+        抓拍已经在前面做过了，这里直接放弃（该条记录无图）。
+        """
+        if self._app_msg_client is None:
+            return
+        if not self._cover_pending:
+            return
+
+        now_mono = time.monotonic()
+        if now_mono - self._cloud_clips_at >= COVER_POLL_INTERVAL_S:
+            self._cloud_clips_at = now_mono
+            try:
+                clips = await self._app_msg_client.async_get_cloud_clips()
+                self._cloud_clips = clips
+                _LOGGER.debug("云录像列表：%d 段（最早 %s）", len(clips), clips[0].start_ms if clips else "-")
+            except (AppDataUnavailable, AppMsgError, AppMsgConfigError) as err:
+                # 没开通云存储 / 设备刚睡着都可能走到这里，降级即可，不打扰用户
+                _LOGGER.debug("云录像列表暂不可用：%s", err)
+
+        started = 0
+        for uid, ev in list(self._cover_pending.items()):
+            if uid in self._cover_tasks:
+                continue
+            clip = self._match_cloud_clip(ev.open_time_ms)
+            if clip is not None and started < COVER_MAX_PER_CYCLE:
+                self._cloud_clip_seen.add(clip.key)
+                self._cover_tasks.add(uid)
+                started += 1
+                self.hass.async_create_task(self._async_fetch_cover(uid, ev, clip))
+                continue
+            # 过了等待窗口还没匹配到 → 放弃（C 模式才回落 capture，B 模式到此为止）
+            if now_mono >= self._cover_deadline.get(uid, 0):
+                self._cover_pending.pop(uid, None)
+                self._cover_deadline.pop(uid, None)
+                self._cover_done.add(uid)
+                self._cover_stats["cloud_miss"] += 1
+                _LOGGER.info(
+                    "云封面未匹配到片段（%s，%s），%s",
+                    ev.open_time_iso,
+                    ev.open_type_name,
+                    "改用 device/capture 补拍"
+                    if (self._cover_first and self._capture_enabled)
+                    else "该条记录将无图",
+                )
+                if self._cover_first and self._capture_enabled:
+                    self.hass.async_create_task(self._async_capture_fallback(ev))
+
+    async def _async_fetch_cover(self, uid: str, ev: DoorEvent, clip: AppCloudClip) -> None:
+        """下载封面图落盘，并挂到事件上。"""
+        try:
+            if not clip.cover_url:
+                raise EzvizApiError("封面 URL 为空")
+            stamp = dt_util.as_local(
+                datetime.fromtimestamp(ev.open_time_ms / 1000, tz=dt_util.UTC)
+            )
+            date_dir = self._snapshot_root / stamp.strftime("%Y-%m-%d")
+            slug = OPEN_TYPE_SLUGS.get(ev.open_type, "unknown")
+            dest = date_dir / f"{stamp.strftime('%H%M%S')}_{slug}_cloud.jpg"
+            written = await self.client.async_download(
+                clip.cover_url, dest, max_bytes=20 * 1024 * 1024
+            )
+            if written < COVER_MIN_BYTES:
+                raise EzvizApiError(f"封面图过小（{written}B）")
+
+            old_path = ev.snapshot_path
+            ev.snapshot_path = str(dest)
+            ev.snapshot_url = self._abs_to_url(dest)
+            ev.snapshot_source = "cloud"
+            # 图片的真实拍摄时刻 = 片段起点，不是「我发现它的时刻」
+            ev.capture_ms = clip.start_ms
+            if old_path and old_path != str(dest):
+                await self._async_remove_file(old_path)
+
+            self._cover_stats["cloud_ok"] += 1
+            # 回溯 = 图片对应的开门时刻已经过去很久，不是这次轮询实时发现的
+            if int(time.time() * 1000) - ev.open_time_ms > COVER_WAIT_S * 1000:
+                self._cover_stats["backfill"] += 1
+            _LOGGER.info(
+                "云封面补图成功：%s（片段 %s，偏差 %+d 秒，%d KB）",
+                ev.snapshot_url,
+                dt_util.as_local(datetime.fromtimestamp(clip.start_ms / 1000, tz=dt_util.UTC)).strftime("%H:%M:%S"),
+                int((ev.open_time_ms - clip.start_ms) / 1000),
+                written // 1024,
+            )
+        except (EzvizApiError, OSError) as err:
+            _LOGGER.warning("云封面下载失败（%s）：%s", ev.open_time_iso, err)
+            self._cover_stats["cloud_miss"] += 1
+        except Exception:  # noqa: BLE001 - 补图失败绝不能影响主循环
+            _LOGGER.exception("云封面补图异常：%s", ev.open_time_iso)
+            self._cover_stats["cloud_miss"] += 1
+        finally:
+            self._cover_tasks.discard(uid)
+            self._cover_pending.pop(uid, None)
+            self._cover_deadline.pop(uid, None)
+            self._cover_done.add(uid)
+            if ev.snapshot_path:
+                await self._async_save_state()
+
+    async def _async_capture_fallback(self, ev: DoorEvent) -> None:
+        """【仅 C 模式】等满窗口仍无云封面时，才动 device/capture。
+
+        B 模式（默认，capture 保底 + 封面兜底）下抓拍在事件发现时已经做过，
+        不会再走到这里 —— 抓不到就是抓不到，不重复打扰设备。
+
+        同一批里可能有好几条同时过期（比如一轮同步发现 4 条开门），这里做 60 秒
+        节流：相邻两次兜底抓拍至少隔 60 秒，且只给最早的那条拍（抓到的画面
+        对后来的事件来说已经晚了，拍了也对不上人）。
+        """
+        now_mono = time.monotonic()
+        if now_mono - getattr(self, "_last_capture_at", 0.0) < 60:
+            _LOGGER.info("兜底抓拍已在上分钟内执行过，跳过（%s）", ev.open_time_iso)
+            return
+        # 让同批里最早的事件先拍；后面的在 60 秒节流里自动跳过
+        self._last_capture_at = now_mono
+        try:
+            url = await self.client.async_capture(channel_no=self._channel_no)
+        except EzvizApiError as err:
+            _LOGGER.warning("兜底抓拍失败（%s）：%s", ev.open_time_iso, err)
             return
         if not url:
-            _LOGGER.warning("实时抓拍未返回图片地址")
+            _LOGGER.warning("兜底抓拍未返回图片地址（%s）", ev.open_time_iso)
             return
-        await self._async_archive_capture(target, url)
+        self._cover_stats["capture_fallback"] += 1
+        await self._async_archive_capture(ev, url)
 
     # ------------------------------------------------------------------ 告警兜底
     async def _async_sync_alarm_opens(self, today_start_ms: int, now_ms: int) -> None:
@@ -1352,19 +1747,39 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 continue
             lo = existing_by_uid.get(uid)
             if lo is None:
-                lo = LoiterEvent(
-                    uid=uid,
-                    alarm_type=alarm.alarm_type,
-                    alarm_type_name=self.alarm_type_name(alarm.alarm_type) or "徘徊检测",
-                    time_ms=alarm.alarm_time,
-                    alarm_id=alarm.alarm_id or None,
-                    pre_s=alarm.pre_time or LOITER_DEFAULT_PRE_S,
-                    post_s=alarm.delay_time or LOITER_DEFAULT_POST_S,
+                # v1.8.1：App 与 alarm/list 对同一次徘徊下发的是两个不同的 msg_id
+                # （实测 MWMSEUS5BYO_83S0P3I00 与 MWMSEUS5BYO_85N62O200，time_ms 完全相同），
+                # 仅按 uid 精确匹配挡不住，页面上就是两条一模一样的徘徊记录。
+                # 这里再按「同类型 + 时间窗」认一次双胞胎：认到就沿用已有记录，
+                # 后续补抓拍图 / 补录像仍走 lo，不会丢功能。
+                twin = next(
+                    (
+                        item
+                        for item in self._loiter
+                        if item.alarm_type == alarm.alarm_type
+                        and abs(item.time_ms - alarm.alarm_time)
+                        <= APP_MSG_LOITER_WINDOW_MS
+                    ),
+                    None,
                 )
-                self._loiter.append(lo)
-                self._loiter_seen.add(uid)
-                existing_by_uid[uid] = lo
-                fresh.append(lo)
+                if twin is not None:
+                    self._loiter_seen.add(uid)
+                    existing_by_uid[uid] = twin
+                    lo = twin
+                else:
+                    lo = LoiterEvent(
+                        uid=uid,
+                        alarm_type=alarm.alarm_type,
+                        alarm_type_name=self.alarm_type_name(alarm.alarm_type) or "徘徊检测",
+                        time_ms=alarm.alarm_time,
+                        alarm_id=alarm.alarm_id or None,
+                        pre_s=alarm.pre_time or LOITER_DEFAULT_PRE_S,
+                        post_s=alarm.delay_time or LOITER_DEFAULT_POST_S,
+                    )
+                    self._loiter.append(lo)
+                    self._loiter_seen.add(uid)
+                    existing_by_uid[uid] = lo
+                    fresh.append(lo)
 
             # 抓拍图与录像都交给后台，主循环只登记任务
             if (
@@ -2148,12 +2563,48 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         return 1, "default"
 
     # ------------------------------------------------------------------ 媒体归档
-    async def _async_load_clean_clips(self) -> list[dict[str, Any]]:
+    async def _async_load_clean_clips(self, *, force_full: bool = False) -> list[dict[str, Any]]:
         """读取逐帧验收白名单，生成前端可播的「干净开门录像」索引。
 
-        clean_clips.json 由 ezviz_sd_pull.py 在成品逐帧自检合格后写入；
-        这里再核一次 size + md5，文件被换过就不认 —— 绿片绝对进不了匹配池。
+        clean_clips.json 由 ezviz_sd_pull.py 在成品逐帧自检合格后写入；集成再核
+        size + md5，文件被换过就不认 —— 绿片绝对进不了匹配池。
+
+        v1.9.2 性能修复：冷启动不再阻塞在 30 段录像的全文件 MD5 上（实测 58.6s，
+        导致 HA 打 "Waiting for integrations to complete setup"）。改为：
+          ① 上次全量验证通过时把索引 stamp + 每段 (size, mtime_ns) 存进状态；
+          ② 冷启动只做 stat 比对，指纹全对就复用已验证结果；
+          ③ 无论命中与否，启动后都由后台任务再做一次完整 MD5 复核并刷新缓存。
+        stat 指纹任一不符就当缓存失效：当轮不挂任何录像，等后台验完再挂。
         """
+        idx_path = self._media_root / "clean_clips.json"
+
+        def _read_stamp() -> tuple[int, int] | None:
+            try:
+                st = idx_path.stat()
+                return (st.st_mtime_ns, st.st_size)
+            except OSError:
+                return None
+
+        def _read_entries() -> list[dict[str, Any]] | None:
+            try:
+                idx = json.loads(idx_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            out: list[dict[str, Any]] = []
+            for c in idx.get("clean") or []:
+                if not c.get("usable_for_open") or not c.get("start_ms"):
+                    continue
+                # green_ratio 合法值就是 0.0，不能用 `or 1` 兜底（会把 0 当成缺失）
+                gr, fr = c.get("green_ratio"), c.get("frames")
+                if gr is None or fr is None or float(gr) > 0.02 or int(fr) < 15:
+                    continue
+                rel = str(c.get("rel") or "")
+                if "/" not in rel or ".." in rel or not rel:
+                    continue
+                out.append(c)
+            # 只校验/展示最近 30 段：全量复核也必须限定范围，
+            # 否则 117 段录像的 md5 会把启动后的后台任务拖成几分钟。
+            return sorted(out, key=lambda x: int(x["start_ms"]), reverse=True)[:30]
 
         def _md5(p: Path) -> str:
             h = hashlib.md5()
@@ -2162,34 +2613,24 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                     h.update(chunk)
             return h.hexdigest()
 
-        idx_path = self._media_root / "clean_clips.json"
-
-        def _scan():
-            try:
-                st = idx_path.stat()
-                stamp = (st.st_mtime_ns, st.st_size)
-            except OSError:
+        def _scan_full():
+            """完整复核（MD5），只在后台任务里跑。"""
+            stamp = _read_stamp()
+            if stamp is None:
                 return None
-            if stamp == self._clean_index_stamp and self.clean_clips:
-                return "unchanged"
-            try:
-                idx = json.loads(idx_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            entries = _read_entries()
+            if entries is None:
                 return None
             ok: list[dict[str, Any]] = []
-            for c in idx.get("clean") or []:
-                if not c.get("usable_for_open") or not c.get("start_ms"):
-                    continue
-                # 注意：green_ratio 合法值就是 0.0，不能用 `or 1` 兜底（会把 0 当成缺失）
-                gr, fr = c.get("green_ratio"), c.get("frames")
-                if gr is None or fr is None or float(gr) > 0.02 or int(fr) < 15:
-                    continue
-                rel = str(c.get("rel") or "")
-                if "/" not in rel or ".." in rel:
-                    continue
+            fp: dict[str, list[int]] = {}
+            for c in entries:
+                rel = c["rel"]
                 p = self._media_root / rel
                 try:
-                    if not p.is_file() or p.stat().st_size != int(c.get("size") or -1):
+                    if not p.is_file():
+                        continue
+                    st = p.stat()
+                    if st.st_size != int(c.get("size") or -1):
                         continue
                     if _md5(p) != c.get("md5"):
                         _LOGGER.warning("白名单里的录像已被改动，拒绝使用：%s", rel)
@@ -2197,21 +2638,60 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 except OSError:
                     continue
                 ok.append(c)
-            return stamp, ok
+                fp[rel] = [st.st_size, st.st_mtime_ns]
+            return stamp, ok, fp
+
+        def _scan_quick():
+            """冷启动快路径：只 stat，不读录像内容；任一指纹不符即返回 None。"""
+            stamp = _read_stamp()
+            if stamp is None:
+                return None
+            cache = self._clean_cache
+            if cache.get("stamp") != list(stamp):
+                return None
+            files = cache.get("files")
+            if not isinstance(files, dict) or not files:
+                return None
+            entries = _read_entries()
+            if entries is None:
+                return None
+            for c in entries:
+                rel = c["rel"]
+                expect = files.get(rel)
+                if not isinstance(expect, list) or len(expect) != 2:
+                    return None
+                p = self._media_root / rel
+                try:
+                    if not p.is_file():
+                        return None
+                    st = p.stat()
+                except OSError:
+                    return None
+                if [st.st_size, st.st_mtime_ns] != list(expect):
+                    return None
+            return stamp, entries, None
+
+        # 同一进程内的轮询直接复用；全量复核必须绕过这一层
+        if not force_full and self._clean_index_stamp is not None:
+            return self.clean_clips
 
         try:
-            res = await self.hass.async_add_executor_job(_scan)
+            res = await self.hass.async_add_executor_job(
+                _scan_full if force_full else _scan_quick
+            )
         except OSError as err:
             _LOGGER.debug("读取干净录像白名单失败：%s", err)
             return self.clean_clips
-        if res == "unchanged":
-            return self.clean_clips
+
         if res is None:
-            self.clean_clips = []
-            self._clean_index_stamp = None
+            if not force_full:
+                # 没有可信缓存：先空着上线，后台验完再挂（绝不拿未验的片冒险）
+                self.clean_clips = []
+                self._clean_index_stamp = None
+                self._schedule_clean_verify()
             return self.clean_clips
 
-        stamp, ok = res
+        stamp, ok, fp = res
         clips: list[dict[str, Any]] = []
         for c in sorted(ok, key=lambda x: int(x["start_ms"]), reverse=True)[:30]:
             try:
@@ -2229,8 +2709,12 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             })
         self.clean_clips = clips
         self._clean_index_stamp = stamp
-        if clips:
-            _LOGGER.info("加载 %d 段逐帧验收合格的开门录像，供前端按时间匹配", len(clips))
+        if fp is not None:
+            self._clean_cache = {"stamp": list(stamp), "files": fp}
+            await self._async_save_state()
+            _LOGGER.info("干净录像白名单已在后台完成全量 MD5 复核（%d 段）", len(clips))
+        elif clips:
+            _LOGGER.info("复用已验证的干净录像索引 %d 段，供前端按时间匹配", len(clips))
         return clips
 
     def _abs_to_url(self, path: Path) -> str:
@@ -2404,15 +2888,50 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
             await self._async_remove_file(old_path)
 
     def async_schedule_late_fill(self) -> None:
-        """启动完成后调度「补图」后台任务。
+        """启动完成后调度「补图 / 录像复核」后台任务。
 
-        启动阶段只做接口查询（秒级），图片下载全部推迟到这里，
-        避免 bootstrap 等待超时导致前端打不开页面。
+        启动阶段只做接口查询和 stat（秒级），图片下载和大文件 MD5 全部推迟到
+        这里，避免 bootstrap 等待超时导致前端打不开页面。
         """
         if getattr(self, "_late_fill_started", False):
             return
         self._late_fill_started = True
         self.hass.async_create_task(self._async_late_fill_snapshots())
+
+    def _schedule_clean_verify(self) -> None:
+        """缓存失效时，启动完成后再做全量 MD5（定时器回调，不占用启动任务）。"""
+        if self._clean_verify_cancel is not None:
+            return
+        self._clean_verify_cancel = async_call_later(
+            self.hass, 30, self._async_start_clean_verify
+        )
+
+    def _async_start_clean_verify(self, _now: Any) -> None:
+        self._clean_verify_cancel = None
+        task = self._clean_verify_task
+        if task is not None and not task.done():
+            return
+        self._clean_verify_task = self.hass.async_create_task(
+            self._async_verify_clean_clips()
+        )
+
+    def async_cancel_clean_verify(self) -> None:
+        """卸载条目时取消尚未执行的后台复核。"""
+        if self._clean_verify_cancel is not None:
+            self._clean_verify_cancel()
+            self._clean_verify_cancel = None
+        task = self._clean_verify_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _async_verify_clean_clips(self) -> None:
+        """启动后做一次全量 MD5，结果写回状态供下次冷启动复用。"""
+        try:
+            await self._async_load_clean_clips(force_full=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 复核失败绝不能影响主循环
+            _LOGGER.exception("后台复核干净录像白名单失败")
 
     async def _async_late_fill_snapshots(self) -> None:
         """给今天缺图的门外开门补下载告警原图（后台执行，失败不影响实体）。"""

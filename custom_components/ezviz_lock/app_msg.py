@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,10 @@ MESSAGE_PATH = "/v3/unifiedmsg/list"
 # 直接当 DoorRecord.open_time 用；records 对应 video/by/time 的 SD 录像段检索。
 OPEN_EVENTS_PATH = "/v3/doorlocks/home/openEvents"
 STREAMING_RECORDS_PATH = "/v3/streaming/records"
+# v1.9.0：云存储录像列表 —— 每条片段自带 coverPic（带 ticket 的完整 URL），
+# 可直接下载成 JPEG，不消耗开放平台配额、也不需要设备在线（实测 2026-11-19）。
+CLOUD_VIDEOS_PATH = "/v3/clouds/videos/list"
+CLOUD_CLIPS_LIMIT = 20          # 服务端硬上限：limit=50/100/200 都只回 20 条，且无分页参数
 OPEN_EVENTS_NUM = 50            # 实测 num=10 有值、num=50 有时 data=null，取 50 覆盖全天再回退兜底
 RECORDS_SIZE = 50
 
@@ -117,6 +122,48 @@ class AppRecordSegment:
     end_local: str
     rec_type: str
     channel_type: str = "D"
+
+
+@dataclass(slots=True)
+class AppCloudClip:
+    """云存储录像的一段片段（``/v3/clouds/videos/list``）。
+
+    实测（2026-11-19）返回 ``videos[]``（**注意字段名是 videos 不是 data**），字段：
+    ``startTime``/``stopTime`` 为设备本地时间字符串；``coverPic`` 是**带 ticket 的完整
+    URL**，直接 GET 即得事件首帧 JPEG；``fileIndex`` 在多段之间会重复（一个底层文件被
+    切成多段），因此唯一标识必须用 ``(file_index, start_ms)``，不能只用 fileIndex。
+    """
+
+    start_ms: int           # 片段起点（毫秒，按 UTC+8 解释）
+    stop_ms: int            # 片段终点
+    video_long_ms: int
+    file_size: int
+    cover_url: str          # coverPic 原样（内含 ticket，禁止重新 urlencode）
+    file_index: str = ""
+    cloud_type: int = 0
+    expire_time: str = ""
+    channel_no: int = 1
+
+    @property
+    def key(self) -> str:
+        return f"{self.file_index}@{self.start_ms}"
+
+
+def _parse_local_ms(text: str) -> int:
+    """萤石返回的 "YYYY-MM-DD HH:MM:SS" 是**设备本地时间（UTC+8）**。
+
+    不用 ``datetime.timestamp()``：那会把结果绑到进程本地时区，一旦 HAOS 时区
+    被改（或容器是 UTC）整张时间表就错位 8 小时。这里显式按 UTC+8 换算。
+    """
+    s = (text or "").strip()
+    if not s:
+        return 0
+    try:
+        dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return 0
+    epoch = datetime(1970, 1, 1)
+    return int((dt - epoch).total_seconds() * 1000) - 8 * 3600 * 1000
 
 
 def load_app_config(config_root: Path) -> dict[str, Any] | None:
@@ -517,4 +564,77 @@ class EzvizAppMsgClient:
                     channel_type=str(item.get("channelType") or "D"),
                 )
             )
+        return out
+
+    async def async_get_cloud_clips(self, limit: int = CLOUD_CLIPS_LIMIT) -> list[AppCloudClip]:
+        """云存储录像片段列表 —— 事件配图与回溯补图的免费来源。
+
+        这是**云存储**（cloudType=4，购买套餐后保留 N 天）的片段，不是 SD 卡。
+        实测要点（2026-11-19）：
+          * 返回字段是 ``videos[]``，不是 ``data``；
+          * 服务端硬上限 20 条，``limit`` 传再大也只回 20，``offset``/``page`` 无效；
+          * ``coverPic`` 是带 ticket 的完整 URL，**必须原样使用** —— 重新
+            urlencode 会破坏 ticket，服务端回 ``Check ticket err``；
+          * 不需要设备在线，也不需要唤醒设备（走 alicloud HTTP）。
+
+        失败抛 ``AppDataUnavailable``（调用方降级即可，不能拖垮轮询）。
+        """
+        data = await self._authed_get(
+            CLOUD_VIDEOS_PATH,
+            {
+                "deviceSerial": self._device_serial,
+                "channelNo": "1",
+                "limit": str(limit),
+                "videoType": "2",
+                "supportMultiChannelSharedService": "0",
+            },
+            label="clouds/videos/list",
+        )
+        meta = data.get("meta") or {}
+        code = int(meta.get("code") or 0)
+        if code != 200:
+            raise AppDataUnavailable(f"clouds/videos/list meta={meta}")
+        raw = data.get("videos")
+        if raw is None:
+            # 没有云存储套餐 / 当天无录像时服务端可能给 null
+            return []
+        if not isinstance(raw, list):
+            raise AppDataUnavailable("clouds/videos/list videos 非列表")
+
+        out: list[AppCloudClip] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            start_ms = _parse_local_ms(str(item.get("startTime") or ""))
+            if not start_ms:
+                continue
+            stop_ms = _parse_local_ms(str(item.get("stopTime") or ""))
+            try:
+                video_long = int(item.get("videoLong") or 0)
+            except (TypeError, ValueError):
+                video_long = 0
+            if video_long <= 0 and stop_ms > start_ms:
+                video_long = stop_ms - start_ms
+            try:
+                file_size = int(item.get("fileSize") or 0)
+            except (TypeError, ValueError):
+                file_size = 0
+            try:
+                cloud_type = int(item.get("cloudType") or 0)
+            except (TypeError, ValueError):
+                cloud_type = 0
+            out.append(
+                AppCloudClip(
+                    start_ms=start_ms,
+                    stop_ms=stop_ms or (start_ms + video_long),
+                    video_long_ms=video_long,
+                    file_size=file_size,
+                    cover_url=str(item.get("coverPic") or ""),
+                    file_index=str(item.get("fileIndex") or ""),
+                    cloud_type=cloud_type,
+                    expire_time=str(item.get("expireTime") or ""),
+                    channel_no=int(item.get("channelNo") or 1),
+                )
+            )
+        out.sort(key=lambda c: c.start_ms)
         return out
