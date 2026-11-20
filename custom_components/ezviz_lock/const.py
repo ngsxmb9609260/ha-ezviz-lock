@@ -11,7 +11,7 @@ from __future__ import annotations
 
 DOMAIN = "ezviz_lock"
 NAME = "EZVIZ Lock"
-VERSION = "1.9.2"
+VERSION = "1.9.6"
 
 # ---- 配置键 ----
 CONF_APP_KEY = "app_key"
