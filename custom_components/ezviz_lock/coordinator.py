@@ -2794,9 +2794,17 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
                 return None
             return stamp, safe, None
 
-        # 同一进程内的轮询直接复用；全量复核必须绕过这一层
+        # 同一进程内的轮询：索引文件没变就复用内存结果；全量复核必须绕过这一层。
+        #
+        # v1.9.6 修复（实测 2026-11-20）：以前只看「本进程是否已加载过」，一旦
+        # _clean_index_stamp 非空就永远 return 内存列表，再也不看 clean_clips.json。
+        # 而拉流脚本每补一段就改写索引（16:11 实测 148 条 / 今天 11 段），集成内存
+        # 里却停在 08:42 那次加载的 30 段（今天仅 2 段）→ 磁盘上明明有录像，
+        # 页面就是匹配不上。现在 stamp 变了一定重扫。
         if not force_full and self._clean_index_stamp is not None:
-            return self.clean_clips
+            if _read_stamp() == self._clean_index_stamp:
+                return self.clean_clips
+            _LOGGER.info("clean_clips.json 已更新，刷新干净录像白名单")
 
         try:
             res = await self.hass.async_add_executor_job(
@@ -2808,10 +2816,15 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
 
         if res is None:
             if not force_full:
-                # 没有可信缓存：先空着上线，后台验完再挂（绝不拿未验的片冒险）
+                # v1.9.6：算不出可信结果（例如索引里全是被改动/新增、还没验过的片段）
+                # 时保留上次白名单，等后台复核替换 —— 以前这里直接清空，用户会看到
+                # 正在看的录像突然全消失。
+                self._schedule_clean_verify()
+                if self.clean_clips and self._clean_index_stamp is not None:
+                    return self.clean_clips
+                # 真的一次都没成功过：先空着上线，后台验完再挂（绝不拿未验的片冒险）
                 self.clean_clips = []
                 self._clean_index_stamp = None
-                self._schedule_clean_verify()
             return self.clean_clips
 
         stamp, ok, fp = res
@@ -3056,7 +3069,10 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
 
     async def _async_verify_clean_clips(self) -> None:
         """启动后做一次全量 MD5，结果写回状态供下次冷启动复用。"""
-        before = len(self.clean_clips)
+        # v1.9.6：按「文件集合」判断有没有变化，不能只看条数 ——
+        # 拉流脚本新增 1 段同时挤掉最旧 1 段时条数不变，以前这里会直接 return，
+        # 新增的那段就永远挂不上。
+        before = {c["rel"] for c in self.clean_clips}
         try:
             await self._async_load_clean_clips(force_full=True)
         except asyncio.CancelledError:
@@ -3067,7 +3083,7 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
         # v1.9.4：启动快路径只挂「有指纹」的旧片段，新增片段要等这次复核。
         # 复核补齐白名单后必须重新认领一次录像地址，否则启动时被清掉的
         # clip_url 永远挂不回来 —— 前端表现就是「有录像文件但打不开」。
-        if before > 0 and len(self.clean_clips) == before:
+        if before and before == {c["rel"] for c in self.clean_clips}:
             return
         try:
             await self._async_backfill_clips(self._events)
