@@ -155,6 +155,15 @@ A 路重编码成品逐帧 0.00% 绿。软解 / 硬解 / `+genpts` / `ignore_err
 - `sensor.<slug>_last_open_time` / `last_opened_by` / `last_unlock_method` / `last_pass_through_headcount`
 - `event.<slug>_door_open_event`——11 种 `event_type`，供自动化触发
 - `image.<slug>_last_snapshot`
+- `binary_sensor.<slug>_online`——**云端在线**：设备与萤石云的心跳状态，10 分钟查一次，
+  慢但抗抖动，判断的是「能不能连到云」。
+- `binary_sensor.<slug>_lock_on_lan`——**门锁在网**（v1.9.7）：局域网内**被动监听**门锁自己发出的
+  ARP 探测帧（实测约 55 秒一帧），连续 3 个周期没见到才判「不在网」。不发任何报文、不唤醒设备，
+  判断的是「还在不在 WiFi 上」。需要容器有 `NET_RAW`（HAOS 默认容器实测可用）；开不出原始套接字时
+  实体变 `unavailable`，不会伪装成「不在网」。
+
+> 两个传感器互为交叉验证：都 `off` 才是真出事；只有「在网」掉而「在线」还在，说明是局域网侧问题
+> （AP 掉线、IP 冲突之类），而不是设备断网。
 
 ---
 
@@ -455,7 +464,7 @@ SD_DUAL=0          # SD 侧只出 A 路（排查用）
   - **v1.9.1**：配图改为 **capture 保底 + 云封面兜底**：发现新开门仍立即 `device/capture` 抓拍；
     抓拍失败或同批事件本就无图时，才用云录像 `coverPic` 补图（走 alicloud HTTP，不消耗开放平台配额）。
     传感器属性新增 `cover_stats`。
-  - **v1.9.2（当前）**：修复冷启动慢（实测 30 段录像全量 MD5 校验耗时 58.6s，触发 HA
+  - **v1.9.2**：修复冷启动慢（实测 30 段录像全量 MD5 校验耗时 58.6s，触发 HA
     `Waiting for integrations to complete setup`）。已验证的录像索引指纹写入状态文件，冷启动只做 `stat`
     比对，指纹不符时再由启动后的后台任务做全量复核；复核范围限定最近 30 段。
     重载集成实测从 61s 降到 9s，冷启动不再出现该警告。
@@ -478,6 +487,18 @@ SD_DUAL=0          # SD 侧只出 A 路（排查用）
     （新增一段同时挤掉最旧一段时条数不变，旧写法会漏判）。
     修后实测：当天录像 2 段 → 11 段，门外开门 3/3 有录像、3/3 有图，徘徊 6/7 就绪。
   - 若状态文件已有旧缓存，首次启动会自动补做一次全量复核；之后无需重复。
+- **升级到 v1.9.7（新增「门锁在网」局域网被动探活）**：
+  - 新实体 `binary_sensor.<slug>_lock_on_lan`。判据是**只听不发**：门锁休眠时仍会每约 55 秒主动发一次
+    ARP 探测帧（`who-has 自己 tell 自己`，2026-11-23 实测：连续 11 个采样点间隔全为 55.0 秒），
+    集成用 `AF_PACKET + SOCK_RAW + ETH_P_ARP` 旁路监听，按「源 IP = 云端 `localAddress`」认帧。
+    连续 3 个周期（180 秒）没见到才判 `off`，启动后给 240 秒宽限避免首帧前误报。
+  - **为什么不用 arping**：实测休眠中的门锁对广播 ARP 请求**一封都不回**（`arping` 0 应答、
+    `nmap -sn -PR` 判 down），但邻居表里有旧 MAC 时 `ping` 3/3 通 —— 用 arping 当判据会把正常休眠
+    误判成掉线。被动监听则完全不打扰设备。
+  - 前端面板健康度条同步改为两个胶囊：`云通 / 云断`（云端心跳）与 `在网 / 掉线`（局域网），
+    悬停可看「最后一帧 N 秒前 · 间隔 55 秒 · 累计 N 帧」。**升级后需重新执行第 5 节第 1 步的 `cp`**
+    才会拿到新面板。
+  - 不新增第三方依赖、不改 `configuration.yaml`、不产生额外云调用。
 - **停用补录**：在「设置 → 自动化」停用 `门锁录像补录（SD 优先 + 云端兜底）` 与 `门锁云录像补录（慢兜底）`，或删掉 `configuration.yaml` 里的 `shell_command` 块再重启。已经拉好的 mp4 不受影响。
 - **卸载集成**：HACS 里移除 → 重启 HA。已生成的抓拍图 / 录像仍在 `/media/tpcamera/door-lock/`，按需自行清理。
 - **回滚配置**：改动前先备份 `configuration.yaml` / `automations.yaml`；脚本本身只写媒体文件与 `clean_clips.json`，不改 HA 配置、不重启 HA。

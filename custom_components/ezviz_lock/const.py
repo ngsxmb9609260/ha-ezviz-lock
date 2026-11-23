@@ -11,7 +11,7 @@ from __future__ import annotations
 
 DOMAIN = "ezviz_lock"
 NAME = "EZVIZ Lock"
-VERSION = "1.9.6"
+VERSION = "1.9.7"
 
 # ---- 配置键 ----
 CONF_APP_KEY = "app_key"
@@ -214,6 +214,13 @@ MEMBERS_POLL_INTERVAL_S = 1800
 # v1.8.0：device/info（在线/WiFi信号/本地IP）原来是每轮 20s 一次、独占 4320 次/天，
 # 是开放平台调用大头。电池门锁状态变化慢，降到 10 分钟一次足够，省约 4260 次/天。
 DEVICE_POLL_INTERVAL_S = 600
+
+# ---- 局域网被动探活（lan_watch）----
+# 门锁休眠时仍每 ~55 秒发一次 ARP 探测帧（2026-11-23 实测）。连续 3 个周期没见到
+# 就判「不在网」；刚启动时给一个宽限期，避免首帧到来前误报离线。
+LAN_WATCH_TIMEOUT_S = 180
+LAN_WATCH_GRACE_S = 240
+LAN_WATCH_SCAN_S = 10  # 实体自身轮询间隔，决定状态翻转的发现延迟
 # /api/v3/keyValue 返回的 multiPower 里 Status 的取值
 POWER_STATUS_NAMES: dict[str, str] = {
     "0": "未充电",

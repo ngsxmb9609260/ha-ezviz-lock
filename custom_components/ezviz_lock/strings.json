@@ -95,6 +95,9 @@
     "binary_sensor": {
       "online": {
         "name": "门锁在线"
+      },
+      "lan_present": {
+        "name": "门锁在网"
       }
     },
     "button": {

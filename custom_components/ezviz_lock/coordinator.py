@@ -50,6 +50,7 @@ from .app_msg import (
     load_app_config,
 )
 from .health import HealthMonitor, LockHealth, MemberInfo
+from .lan_watch import LanWatcher
 from .hevc_split import SplitError, green_frame_ratio, repair_interleaved_hevc
 from .peek_dual import DualPeekError, extract_dual_frames
 from .const import (
@@ -415,6 +416,9 @@ class EzvizLockCoordinator(DataUpdateCoordinator[LockData]):
 
         # 电量 / 信号 / 在线 / 成员凭证：独立监控器，失败不影响开门主链路
         self.health = HealthMonitor(hass, client)
+        # 局域网被动探活：只听门锁自己发的 ARP 帧（约 55 秒一次），不发包、不唤醒。
+        # 由 __init__.py 在首次刷新后启动，卸载时停止；这里只负责持有一份实例。
+        self.lan_watcher: LanWatcher | None = None
         # 「门前看一眼」最近一次的实时抓拍（url + 本地路径 + 时刻）
         self.peek: dict[str, Any] | None = None
 

@@ -56,6 +56,10 @@
     },
     "event": {
       "door_event": {"name": "Door open event"}
+    },
+    "binary_sensor": {
+      "online": {"name": "Lock online"},
+      "lan_present": {"name": "Lock on LAN"}
     }
   },
   "services": {

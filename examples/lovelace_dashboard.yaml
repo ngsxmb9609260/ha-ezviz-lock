@@ -200,6 +200,10 @@ views:
   - type: entities
     title: 全部实体
     entities:
+    - entity: binary_sensor.y3000fvx_plus_yourserial_online
+      name: 云端在线（心跳）
+    - entity: binary_sensor.y3000fvx_plus_yourserial_lock_on_lan
+      name: 局域网在网（监听）
     - entity: sensor.y3000fvx_plus_yourserial_last_opened_by
       name: 最近开门人员
     - entity: sensor.y3000fvx_plus_yourserial_last_open_time

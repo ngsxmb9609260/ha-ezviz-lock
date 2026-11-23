@@ -34,6 +34,7 @@ from .const import (
     VERSION,
 )
 from .coordinator import DoorEvent, EzvizLockCoordinator
+from .lan_watch import LanWatcher
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -249,6 +250,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzvizLockConfigEntry) ->
 
     entry.runtime_data = EzvizLockRuntimeData(client=client, coordinator=coordinator)
     hass.data[DOMAIN][entry.entry_id] = entry.runtime_data
+
+    # 局域网被动探活：只听门锁周期性发出的 ARP 探测帧，一个包都不发，
+    # 因此不会唤醒设备。必须赶在平台 setup 之前挂上，实体一建好就能读到状态。
+    watcher = LanWatcher(
+        lambda: coordinator.data.health.local_address if coordinator.data else None,
+        client.device_serial,
+        config_root / "ezviz_lan_watch.txt",
+    )
+    coordinator.lan_watcher = watcher
+    watcher.start()
+
+    async def _async_stop_lan_watch() -> None:
+        await hass.async_add_executor_job(watcher.stop)
+
+    entry.async_on_unload(_async_stop_lan_watch)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # 实体就绪后再后台补图：启动阶段不做任何图片下载，否则会拖慢甚至卡死启动

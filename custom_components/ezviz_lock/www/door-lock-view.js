@@ -21,6 +21,16 @@ ha-card { overflow: hidden; }
 .stat .v { font-size: 22px; font-weight: 600; line-height: 1.2; margin-top: 4px; font-variant-numeric: tabular-nums; }
 .stat .u { font-size: 11px; color: var(--secondary-text-color); }
 
+/* 健康度条：电量 / 信号 / 在线 / 成员 / 充电状态 */
+.health { display: flex; flex-wrap: wrap; gap: 6px; margin: -2px 0 12px; }
+.hchip { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; padding: 3px 9px; border-radius: 999px;
+         background: var(--secondary-background-color, rgba(127,127,127,.08)); color: var(--secondary-text-color); }
+.hchip ha-icon { --mdc-icon-size: 15px; }
+.hchip b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--primary-text-color); }
+.hchip.ok b { color: var(--success-color, #43a047); }
+.hchip.warn b { color: var(--warning-color, #ff9800); }
+.hchip.bad b { color: var(--error-color, #e53935); }
+
 .tabs { display: flex; gap: 6px; margin-bottom: 12px; border-bottom: 1px solid var(--divider-color); }
 .tab { padding: 8px 14px; font-size: 14px; color: var(--secondary-text-color); cursor: pointer;
        border: none; background: none; font-family: inherit; border-bottom: 2px solid transparent;
@@ -29,6 +39,36 @@ ha-card { overflow: hidden; }
 .tab.on { color: var(--primary-color); border-bottom-color: var(--primary-color); font-weight: 600; }
 .tab .cnt { font-size: 11px; background: var(--secondary-background-color, rgba(127,127,127,.12));
             border-radius: 9px; padding: 1px 6px; font-variant-numeric: tabular-nums; }
+/* 「门前看一眼」常驻在标签栏右侧，不随标签切换消失 */
+.tab.peek { margin-left: auto; color: var(--primary-color); font-weight: 600; border-bottom-color: transparent !important; }
+.tab.peek:disabled { opacity: .5; cursor: progress; }
+
+/* 门前一眼：遮罩 + 大图 */
+.peekbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,.72);
+           display: flex; align-items: center; justify-content: center; padding: 16px; }
+.peekbox .peekcard { background: var(--card-background-color, #fff); border-radius: 14px; overflow: hidden;
+                     max-width: min(92vw, 780px); max-height: 92vh; display: flex; flex-direction: column;
+                     box-shadow: 0 12px 40px rgba(0,0,0,.45); }
+.peekbox .peekhd { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+                   border-bottom: 1px solid var(--divider-color); font-size: 14px; }
+.peekbox .peekhd b { font-size: 15px; }
+.peekbox .peekhd span { margin-left: auto; font-size: 12px; color: var(--secondary-text-color); font-variant-numeric: tabular-nums; }
+.peekbox .peekx { border: none; background: transparent; color: var(--secondary-text-color); font-size: 18px;
+                  cursor: pointer; line-height: 1; padding: 2px 6px; }
+.peekbox .peekx:hover { color: var(--error-color, #e53935); }
+.peekbox .peekbody { padding: 8px 12px 4px; overflow: auto; }
+.peekbox img { max-width: 100%; max-height: 76vh; object-fit: contain; background: #000;
+               display: block; margin: 0 auto; }
+.peekbox .peeklane { margin-bottom: 10px; }
+.peekbox .peeklane .lbl { font-size: 12px; color: var(--secondary-text-color);
+                          padding: 2px 0 5px; display: flex; align-items: center; gap: 6px; }
+.peekbox .peeklane .lbl i { width: 7px; height: 7px; border-radius: 50%; background: var(--primary-color); }
+.peekbox.dual img { max-height: 44vh; }
+.peekbox .peeknote { font-size: 11px; color: var(--secondary-text-color); padding: 0 12px 8px; }
+.peekbox .peekft { padding: 8px 12px; border-top: 1px solid var(--divider-color);
+                   text-align: right; display: flex; gap: 14px; justify-content: flex-end; }
+.peekbox .peekft a { font-size: 12px; color: var(--primary-color); text-decoration: none; }
+.peekbox .peekft a:hover { text-decoration: underline; }
 
 .grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 
@@ -197,7 +237,7 @@ class EzvizDoorLockPanel extends HTMLElement {
   }
 
   static getStubConfig() {
-    return { entity: "sensor.y3000fvx_plus_yourserial_opens_today" };
+    return { entity: "sensor.y3000fvx_plus_bw4390687_opens_today" };
   }
 
   setConfig(config) {
@@ -240,9 +280,19 @@ class EzvizDoorLockPanel extends HTMLElement {
           <div class="stat"><div class="k">本次人数</div><div class="v" id="s-person">—</div><div class="u" id="s-person-u">人</div></div>
         </div>
 
+        <div class="health" id="health">
+          <span class="hchip" id="h-on"><ha-icon icon="mdi:cloud-check"></ha-icon><b>—</b></span>
+          <span class="hchip" id="h-lan"><ha-icon icon="mdi:lan-connect"></ha-icon><b>—</b></span>
+          <span class="hchip" id="h-bat"><ha-icon icon="mdi:battery"></ha-icon><b>—</b></span>
+          <span class="hchip" id="h-sig"><ha-icon icon="mdi:wifi"></ha-icon><b>—</b></span>
+          <span class="hchip" id="h-chg"><ha-icon icon="mdi:power-plug"></ha-icon><b>—</b></span>
+          <span class="hchip" id="h-mem"><ha-icon icon="mdi:account-multiple-check"></ha-icon><b>—</b></span>
+        </div>
+
         <div class="tabs">
           <button class="tab on" data-tab="open"><ha-icon icon="mdi:door-open" style="--mdc-icon-size:16px"></ha-icon>开门记录<span class="cnt" id="c-open">0</span></button>
           <button class="tab" data-tab="loiter"><ha-icon icon="mdi:motion-sensor" style="--mdc-icon-size:16px"></ha-icon>徘徊录像<span class="cnt" id="c-lo">0</span></button>
+          <button class="tab peek" id="btn-peek" title="同时抓拍上摄（人脸）与下摄（地面）"><ha-icon icon="mdi:cctv" style="--mdc-icon-size:16px"></ha-icon>门前看一眼</button>
         </div>
 
         <div class="grid">
@@ -284,8 +334,11 @@ class EzvizDoorLockPanel extends HTMLElement {
       b.addEventListener("click", () => this._action(b.dataset.act));
     });
     this.shadowRoot.querySelectorAll(".tab").forEach((t) => {
+      // 「门前看一眼」也用了 .tab 样式，但它不是标签，不能走 _setTab
+      if (!t.dataset.tab) return;
       t.addEventListener("click", () => this._setTab(t.dataset.tab));
     });
+    this.shadowRoot.getElementById("btn-peek").addEventListener("click", () => this._peekNow());
     this.shadowRoot.getElementById("st-open").addEventListener("click", () => this._setTab("open"));
     this.shadowRoot.getElementById("st-lo").addEventListener("click", () => this._setTab("loiter"));
     this.shadowRoot.getElementById("rows").addEventListener("click", (ev) => {
@@ -348,7 +401,16 @@ class EzvizDoorLockPanel extends HTMLElement {
     const st = hass.states[this._entity];
     const a = (st && st.attributes) || {};
     const raw = Array.isArray(a[this._listKey]) ? a[this._listKey] : [];
-    const list = raw.slice(0, this._max);
+    // 时间倒序：最近的在最上面。后端 today_events / recent_events 按时间升序返回，
+    // 这里统一按 open_time 重排一次，不依赖后端顺序；无法解析时间的排到最后。
+    const list = raw
+      .slice()
+      .sort((x, y) => {
+        const ty = new Date(y.open_time).getTime() || 0;
+        const tx = new Date(x.open_time).getTime() || 0;
+        return ty - tx;
+      })
+      .slice(0, this._max);
     this._list = list;
     this._loiter = Array.isArray(a.loiter_events) ? a.loiter_events.slice(0, this._max) : [];
     // sd_clips 来自集成侧逐帧验收白名单（size+md5 复核过），绿片不在其中
@@ -360,6 +422,7 @@ class EzvizDoorLockPanel extends HTMLElement {
     this.shadowRoot.getElementById("s-lo").textContent = a.loiter_today_count ?? "0";
     this.shadowRoot.getElementById("c-open").textContent = String(list.length);
     this.shadowRoot.getElementById("c-lo").textContent = String(this._loiter.length);
+    this._paintHealth(hass);
 
     const head = list[0] || {};
     this.shadowRoot.getElementById("s-person").textContent = head.person_count ?? "—";
@@ -710,6 +773,202 @@ class EzvizDoorLockPanel extends HTMLElement {
         notify(res.files ? `已删除该条记录与 ${res.files} 个媒体文件` : "已删除该条徘徊记录");
       })
       .catch((err) => notify(`删除失败：${(err && err.message) || err}`));
+  }
+
+  // 健康度条：按 entity_id 后缀查找，实体被改名也不会失联
+  _findState(hass, suffix) {
+    const h = hass || this._hass;
+    if (!h || !h.states) return null;
+    const id = Object.keys(h.states).find((k) => k.endsWith(suffix));
+    return id ? h.states[id] : null;
+  }
+
+  _paintHealth(hass) {
+    const set = (elId, text, cls) => {
+      const el = this.shadowRoot.getElementById(elId);
+      if (!el) return;
+      const b = el.querySelector("b");
+      if (b) b.textContent = text;
+      el.classList.remove("ok", "warn", "bad");
+      if (cls) el.classList.add(cls);
+    };
+
+    const setTitle = (elId, text) => {
+      const el = this.shadowRoot.getElementById(elId);
+      if (el) el.title = text || "";
+    };
+
+    const on = this._findState(hass, "_online");
+    const lan = this._findState(hass, "_lock_on_lan") || this._findState(hass, "_on_lan");
+    const bat = this._findState(hass, "_battery");
+    const sig = this._findState(hass, "_wifi_signal");
+    const chg = this._findState(hass, "_power_status");
+    const mem = this._findState(hass, "_members");
+
+    // 云端通道：设备与萤石云的心跳（10 分钟一查，慢但抗抖动）
+    if (!on) {
+      set("h-on", "—", "");
+      setTitle("h-on", "未找到云端在线实体");
+    } else {
+      const online = on.state === "on";
+      set("h-on", online ? "云通" : "云断", online ? "ok" : "bad");
+      setTitle("h-on", `云端心跳：${online ? "通" : "断"}（每 10 分钟查一次）`);
+    }
+
+    // 局域网通道：只听门锁自己发的 ARP 探测帧（每 55 秒一帧，秒级，零打扰）
+    if (!lan) {
+      set("h-lan", "—", "");
+      setTitle("h-lan", "未找到局域网在网实体");
+    } else {
+      const a = lan.attributes || {};
+      const st = lan.state;
+      if (st === "on") {
+        set("h-lan", "在网", "ok");
+      } else if (st === "off") {
+        set("h-lan", "掉线", "bad");
+      } else {
+        set("h-lan", "—", "warn");
+      }
+      const bits = [];
+      if (st === "unavailable") bits.push("监听未启动");
+      if (a.age_s !== undefined && a.age_s !== null) bits.push(`最后一帧 ${Math.round(a.age_s)} 秒前`);
+      if (a.gap_s !== undefined && a.gap_s !== null) bits.push(`间隔 ${Math.round(a.gap_s)} 秒`);
+      if (a.last_seen) {
+        const ls = String(a.last_seen);
+        bits.push(`最后见到 ${ls.length >= 19 ? ls.slice(11, 19) : ls}`);
+      }
+      if (a.packets !== undefined) bits.push(`累计 ${a.packets} 帧`);
+      if (a.error) bits.push(`错误：${a.error}`);
+      setTitle("h-lan", bits.join(" · ") || "局域网被动监听");
+    }
+
+    const bv = bat && bat.state !== "unknown" && bat.state !== "unavailable" ? Number(bat.state) : NaN;
+    set(
+      "h-bat",
+      Number.isFinite(bv) ? `${bv}%` : "—",
+      Number.isFinite(bv) ? (bv <= 20 ? "bad" : bv <= 40 ? "warn" : "ok") : ""
+    );
+
+    const sv = sig && sig.state !== "unknown" && sig.state !== "unavailable" ? Number(sig.state) : NaN;
+    set(
+      "h-sig",
+      Number.isFinite(sv) ? `${sv}%` : "—",
+      Number.isFinite(sv) ? (sv < 40 ? "bad" : sv < 55 ? "warn" : "ok") : ""
+    );
+
+    const chgText = chg && chg.state && chg.state !== "unknown" ? String(chg.state) : "—";
+    set("h-chg", chgText, chgText === "充电中" ? "warn" : chgText === "电池异常" ? "bad" : "");
+
+    set("h-mem", mem && mem.state !== "unknown" ? `${mem.state} 人` : "—", "");
+  }
+
+  async _peekNow() {
+    const hass = this._hass;
+    if (!hass || this._peeking) return;
+    const done = (message) =>
+      this.dispatchEvent(
+        new CustomEvent("hass-notification", { detail: { message }, bubbles: true, composed: true })
+      );
+    const btn = this.shadowRoot.getElementById("btn-peek");
+    this._peeking = true;
+    if (btn) btn.disabled = true;
+    done("正在抓拍上下两路摄像头，约需 5~30 秒…");
+
+    try {
+      const before = this._peekStampFromState();
+      const r = await hass.callService("ezviz_lock", "peek", {});
+      const res = (r && r.response) || {};
+      let url = res.url || null;
+      let time = res.time || null;
+      let lower = (res.lower && res.lower.url) || null;
+      let mode = res.mode || null;
+      let note = res.note || null;
+      if (!url) {
+        // 少数 HA 版本的 callService 不回传 response，改从「门前一眼快照」实体属性里取
+        const state = await this._waitPeekState(before);
+        url = (state && state.url) || null;
+        time = (state && state.time) || null;
+        lower = (state && state.lower) || null;
+        mode = (state && state.mode) || null;
+        note = (state && state.note) || null;
+      }
+      if (!url) throw new Error(res.error || "抓拍没有返回图片地址");
+      this._showPeek(url, time, lower, mode, note);
+      done(mode === "dual" ? "已抓到上下两路同一时刻的画面" : "已抓到上摄（下摄未取到，已降级）");
+    } catch (err) {
+      const msg = (err && err.message) || String(err);
+      done(`门前看一眼失败：${msg}（门锁可能在休眠，等几秒再试）`);
+    } finally {
+      this._peeking = false;
+      const again = this.shadowRoot.getElementById("btn-peek");
+      if (again) again.disabled = false;
+    }
+  }
+
+  _peekEntity() {
+    const hass = this._hass;
+    if (!hass || !hass.states) return null;
+    const id = Object.keys(hass.states).find((k) => k.endsWith("_peek_snapshot"));
+    return id ? hass.states[id] : null;
+  }
+
+  _peekStampFromState() {
+    const st = this._peekEntity();
+    return (st && st.attributes && st.attributes.peek_time) || null;
+  }
+
+  async _waitPeekState(before) {
+    const pick = (a) => ({
+      url: a.snapshot_url,
+      time: a.peek_time,
+      lower: a.lower_url || null,
+      mode: a.mode || null,
+      note: a.note || null,
+    });
+    for (let i = 0; i < 16; i++) {
+      await new Promise((r) => setTimeout(r, 700));
+      const st = this._peekEntity();
+      const a = (st && st.attributes) || {};
+      if (a.snapshot_url && a.peek_time && a.peek_time !== before) return pick(a);
+    }
+    const st = this._peekEntity();
+    const a = (st && st.attributes) || {};
+    return a.snapshot_url ? pick(a) : null;
+  }
+
+  _showPeek(url, time, lowerUrl, mode, note) {
+    this._closePeek();
+    const dual = !!(lowerUrl && mode === "dual");
+    const box = document.createElement("div");
+    box.className = "peekbox" + (dual ? " dual" : "");
+    const lane = (label, src) =>
+      `<div class="peeklane"><div class="lbl"><i></i>${esc(label)}</div>` +
+      `<img src="${esc(src)}" alt="${esc(label)}" /></div>`;
+    const body = dual
+      ? lane("上摄 · 门外人脸 / 门", url) + lane("下摄 · 门口地面 / 包裹", lowerUrl)
+      : `<img src="${esc(url)}" alt="门前画面" />`;
+    const links = dual
+      ? `<a href="${esc(url)}" target="_blank" rel="noopener">上摄原图 ›</a>` +
+        `<a href="${esc(lowerUrl)}" target="_blank" rel="noopener">下摄原图 ›</a>`
+      : `<a href="${esc(url)}" target="_blank" rel="noopener">新标签打开原图 ›</a>`;
+    box.innerHTML =
+      `<div class="peekcard">` +
+      `<div class="peekhd"><b>门前一眼${dual ? " · 双摄" : ""}</b><span>${esc(time || "")}</span>` +
+      `<button class="peekx" aria-label="关闭">✕</button></div>` +
+      `<div class="peekbody">${body}</div>` +
+      (note ? `<div class="peeknote">${esc(note)}</div>` : "") +
+      `<div class="peekft">${links}</div>` +
+      `</div>`;
+    box.addEventListener("click", (ev) => {
+      if (ev.target === box || ev.target.closest(".peekx")) this._closePeek();
+    });
+    this.shadowRoot.appendChild(box);
+    this._peekBox = box;
+  }
+
+  _closePeek() {
+    if (this._peekBox && this._peekBox.parentNode) this._peekBox.parentNode.removeChild(this._peekBox);
+    this._peekBox = null;
   }
 
   _action(act) {
